@@ -676,6 +676,27 @@ func (m *Manager) SessionName(name string) string {
 	return session.CrewSessionName(session.PrefixFor(m.rig.Name), name)
 }
 
+// Target returns the tmux target for a crew member.
+// In session mode: targets the crew member's own session.
+// In window mode: targets the crew member's window in the rig session.
+func (m *Manager) Target(name string) tmux.TmuxTarget {
+	prefix := session.PrefixFor(m.rig.Name)
+	if config.IsWindowMode(m.townRoot()) {
+		return tmux.TmuxTarget{
+			Session: session.RigSessionName(prefix),
+			Window:  session.WindowName("crew", name),
+		}
+	}
+	return tmux.TmuxTarget{
+		Session: m.SessionName(name),
+	}
+}
+
+// townRoot returns the Gas Town root directory.
+func (m *Manager) townRoot() string {
+	return filepath.Dir(m.rig.Path)
+}
+
 // Start creates and starts a tmux session for a crew member.
 // If the crew member doesn't exist, it will be created first.
 func (m *Manager) Start(name string, opts StartOptions) error {
@@ -713,7 +734,8 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 
 	// Ensure runtime settings exist in the shared crew parent directory.
 	// Settings are passed to Claude Code via --settings flag.
-	townRoot := filepath.Dir(m.rig.Path)
+	townRoot := m.townRoot()
+	windowMode := config.IsWindowMode(townRoot)
 	runtimeConfig := config.ResolveWorkerAgentConfig(name, townRoot, m.rig.Path)
 	crewSettingsDir := config.RoleSettingsDir("crew", m.rig.Path)
 	if err := runtime.EnsureSettingsForRole(crewSettingsDir, worker.ClonePath, "crew", runtimeConfig); err != nil {
@@ -733,6 +755,19 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		Agent:            opts.AgentOverride,
 	})
 	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
+
+	// tmuxTarget is the identifier used for tmux commands after creation.
+	// Session mode: the crew session name.
+	// Window mode: the window target (e.g., "gt-rig:jack").
+	var tmuxTarget string
+	sessionID := m.SessionName(name)
+
+	if windowMode {
+		target := m.Target(name)
+		tmuxTarget = target.String()
+	} else {
+		tmuxTarget = sessionID
+	}
 
 	// Build startup command (also includes env vars via 'exec env' for
 	// WaitForCommand detection — belt and suspenders with -e flags)
@@ -792,7 +827,7 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 			TownRoot:    townRoot,
 			Prompt:      beacon,
 			Topic:       topic,
-			SessionName: m.SessionName(name),
+			SessionName: tmuxTarget,
 		}, m.rig.Path, beacon, opts.AgentOverride)
 		if err != nil {
 			return fmt.Errorf("building startup command: %w", err)
@@ -800,30 +835,40 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	}
 
 	t := tmux.NewTmux()
-	sessionID := m.SessionName(name)
 
-	// Check if session already exists — kill AFTER command is fully built
+	// Check if session/window already exists — kill AFTER command is fully built
 	// so validation failures don't destroy the user's running session.
-	running, err := t.HasSession(sessionID)
-	if err != nil {
-		return fmt.Errorf("checking session: %w", err)
-	}
-	if running {
-		if opts.KillExisting {
-			// Restart/resume mode - kill existing session.
-			// Use KillSessionWithProcesses to ensure all descendant processes are killed.
-			if err := t.KillSessionWithProcesses(sessionID); err != nil {
-				return fmt.Errorf("killing existing session: %w", err)
+	if windowMode {
+		target := m.Target(name)
+		has, _ := t.HasWindow(target.Session, target.Window)
+		if has {
+			if opts.KillExisting {
+				_ = t.KillWindow(target.Session, target.Window)
+			} else {
+				if t.IsAgentAlive(tmuxTarget) {
+					return fmt.Errorf("%w: %s", ErrSessionRunning, tmuxTarget)
+				}
+				// Zombie window — kill and recreate.
+				_ = t.KillWindow(target.Session, target.Window)
 			}
-		} else {
-			// Normal start - session exists, check if agent is actually running
-			if t.IsAgentAlive(sessionID) {
-				return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
-			}
-			// Zombie session - kill and recreate.
-			// Use KillSessionWithProcesses to ensure all descendant processes are killed.
-			if err := t.KillSessionWithProcesses(sessionID); err != nil {
-				return fmt.Errorf("killing zombie session: %w", err)
+		}
+	} else {
+		running, err := t.HasSession(sessionID)
+		if err != nil {
+			return fmt.Errorf("checking session: %w", err)
+		}
+		if running {
+			if opts.KillExisting {
+				if err := t.KillSessionWithProcesses(sessionID); err != nil {
+					return fmt.Errorf("killing existing session: %w", err)
+				}
+			} else {
+				if t.IsAgentAlive(sessionID) {
+					return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+				}
+				if err := t.KillSessionWithProcesses(sessionID); err != nil {
+					return fmt.Errorf("killing zombie session: %w", err)
+				}
 			}
 		}
 	}
@@ -833,18 +878,52 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		claudeCmd = strings.Replace(claudeCmd, " --dangerously-skip-permissions", "", 1)
 	}
 
-	// Create session with command and env vars via -e flags.
-	// The -e flags set session-level env BEFORE the shell starts, ensuring the
-	// initial shell inherits the correct GT_ROLE (not the parent's).
-	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
-	// See: https://github.com/steveyegge/gastown/issues/1289 (env inheritance fix)
-	if err := t.NewSessionWithCommandAndEnv(sessionID, worker.ClonePath, claudeCmd, envVars); err != nil {
-		return fmt.Errorf("creating session: %w", err)
+	// setEnvTarget is the session name for tmux set-environment calls.
+	var setEnvTarget string
+
+	if windowMode {
+		target := m.Target(name)
+		setEnvTarget = target.Session
+
+		// Ensure rig session exists (create-on-first-agent per D1).
+		if exists, _ := t.HasSession(target.Session); !exists {
+			// Create rig session with crew member as the initial window.
+			if err := t.NewSessionWithCommand(target.Session, worker.ClonePath, claudeCmd); err != nil {
+				return fmt.Errorf("creating rig session: %w", err)
+			}
+			if err := t.RenameWindow(target.Session, 0, target.Window); err != nil {
+				style.PrintWarning("could not rename initial window: %v", err)
+			}
+		} else {
+			// Rig session exists — add crew member as a new window.
+			if err := t.NewWindowWithCommand(target.Session, target.Window, worker.ClonePath, claudeCmd); err != nil {
+				return fmt.Errorf("creating crew window: %w", err)
+			}
+		}
+
+		// In window mode, only set rig-wide (session-scoped) env vars.
+		split := config.SplitAgentEnv(envVars)
+		for k, v := range split.SessionEnv {
+			_ = t.SetEnvironment(setEnvTarget, k, v)
+		}
+	} else {
+		setEnvTarget = sessionID
+
+		// Create session with command and env vars via -e flags.
+		// The -e flags set session-level env BEFORE the shell starts, ensuring the
+		// initial shell inherits the correct GT_ROLE (not the parent's).
+		// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
+		// See: https://github.com/steveyegge/gastown/issues/1289 (env inheritance fix)
+		if err := t.NewSessionWithCommandAndEnv(sessionID, worker.ClonePath, claudeCmd, envVars); err != nil {
+			return fmt.Errorf("creating session: %w", err)
+		}
+
+		// Session mode: env vars were set via -e flags, no SetEnvironment needed.
 	}
 
 	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
-	if paneID, err := t.GetPaneID(sessionID); err == nil {
-		_ = t.SetEnvironment(sessionID, "GT_PANE_ID", paneID)
+	if paneID, err := t.GetPaneID(tmuxTarget); err == nil {
+		_ = t.SetEnvironment(setEnvTarget, "GT_PANE_ID", paneID)
 	}
 
 	// Apply rig-based theming (non-fatal: theming failure doesn't affect operation)
@@ -859,13 +938,14 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 			}
 		}
 	}
-	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, name, "crew")
+	_ = t.ConfigureGasTownSession(setEnvTarget, theme, m.rig.Name, name, "crew")
 
-	// Set up C-b n/p keybindings for crew session cycling (non-fatal)
-	_ = t.SetCrewCycleBindings(sessionID)
+	// Set up C-b n/p keybindings for crew session cycling (non-fatal).
+	// Always pass the session name (not window target) since bindings are session-scoped.
+	_ = t.SetCrewCycleBindings(setEnvTarget)
 
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
-	_ = session.TrackSessionPID(townRoot, sessionID, t)
+	_ = session.TrackSessionPID(townRoot, tmuxTarget, t)
 
 	// Wait for the agent to start, then accept any startup dialogs that appear.
 	// Workspace trust dialog is independent of bypass permissions and can appear
@@ -881,22 +961,15 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		}
 		preset := config.GetAgentPresetByName(agentName)
 		if preset != nil && preset.EmitsPermissionWarning {
-			if err := t.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
+			if err := t.WaitForCommand(tmuxTarget, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
 				// Non-fatal — agent might still start
 				style.PrintWarning("timeout waiting for agent to start: %v", err)
 			}
-			_ = t.AcceptStartupDialogs(sessionID)
+			_ = t.AcceptStartupDialogs(tmuxTarget)
 		}
 
 		// Start background nudge-queue poller for ALL agents (gt-dgf).
-		// Claude drains its queue via UserPromptSubmit hook, but that hook only
-		// fires when the agent submits a prompt. Idle agents (waiting at prompt
-		// for work) never submit, so queued nudges deadlock: agent waits for
-		// nudge, nudge waits for agent input. The poller breaks this cycle by
-		// polling every 10s and delivering when idle. Drain() is atomic so the
-		// poller and UserPromptSubmit hook coexist safely.
-		if _, pollerErr := nudge.StartPoller(townRoot, sessionID); pollerErr != nil {
-			// Non-fatal — nudges may be delayed but the agent still works.
+		if _, pollerErr := nudge.StartPoller(townRoot, tmuxTarget); pollerErr != nil {
 			style.PrintWarning("could not start nudge poller for %s: %v", name, pollerErr)
 		}
 	}
@@ -904,16 +977,33 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	return nil
 }
 
-// Stop terminates a crew member's tmux session.
+// Stop terminates a crew member's tmux session or window.
 func (m *Manager) Stop(name string) error {
 	if err := validateCrewName(name); err != nil {
 		return err
 	}
 
 	t := tmux.NewTmux()
-	sessionID := m.SessionName(name)
+	townRoot := m.townRoot()
 
-	// Check if session exists
+	if config.IsWindowMode(townRoot) {
+		target := m.Target(name)
+		has, _ := t.HasWindow(target.Session, target.Window)
+		if !has {
+			return ErrSessionNotFound
+		}
+
+		// Stop the background nudge poller before killing the window.
+		tmuxTarget := target.String()
+		if pollerErr := nudge.StopPoller(townRoot, tmuxTarget); pollerErr != nil {
+			style.PrintWarning("could not stop nudge poller for %s: %v", name, pollerErr)
+		}
+
+		// KillWindow destroys the session if this is the last window (D1).
+		return t.KillWindow(target.Session, target.Window)
+	}
+
+	sessionID := m.SessionName(name)
 	running, err := t.HasSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
@@ -923,15 +1013,12 @@ func (m *Manager) Stop(name string) error {
 	}
 
 	// Stop the background nudge poller before killing the session.
-	// Non-fatal — the poller will exit on its own when the session dies.
-	townRoot := filepath.Dir(m.rig.Path)
 	if pollerErr := nudge.StopPoller(townRoot, sessionID); pollerErr != nil {
 		style.PrintWarning("could not stop nudge poller for %s: %v", name, pollerErr)
 	}
 
 	// Kill the session.
 	// Use KillSessionWithProcesses to ensure all descendant processes are killed.
-	// This prevents orphan bash processes from Claude's Bash tool surviving session termination.
 	if err := t.KillSessionWithProcesses(sessionID); err != nil {
 		return fmt.Errorf("killing session: %w", err)
 	}
@@ -939,9 +1026,13 @@ func (m *Manager) Stop(name string) error {
 	return nil
 }
 
-// IsRunning checks if a crew member's session is active.
+// IsRunning checks if a crew member's session or window is active.
 func (m *Manager) IsRunning(name string) (bool, error) {
 	t := tmux.NewTmux()
+	if config.IsWindowMode(m.townRoot()) {
+		target := m.Target(name)
+		return t.HasWindow(target.Session, target.Window)
+	}
 	sessionID := m.SessionName(name)
 	return t.HasSession(sessionID)
 }

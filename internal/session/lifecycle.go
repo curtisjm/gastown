@@ -110,6 +110,17 @@ type SessionConfig struct {
 
 	// VerifySurvived checks that the session is still alive after startup.
 	VerifySurvived bool
+
+	// WindowMode creates a window in an existing rig session instead of a
+	// standalone tmux session. When true, SessionID is the rig session name
+	// and WindowName must be set. The rig session is created if it doesn't
+	// exist yet (create-on-first-agent per D1).
+	WindowMode bool
+
+	// WindowName is the tmux window name when WindowMode is true.
+	// For singleton agents (witness, refinery): the role name (e.g., "witness").
+	// For named agents (polecats, crew): the agent name (e.g., "Toast").
+	WindowName string
 }
 
 // StartResult contains the results of session startup.
@@ -197,14 +208,47 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	extraWithRun["GT_RUN"] = runID
 	command = config.PrependEnv(command, extraWithRun)
 
-	// 4. Create tmux session with command.
-	if err := t.NewSessionWithCommand(cfg.SessionID, cfg.WorkDir, command); err != nil {
-		return nil, fmt.Errorf("creating session: %w", err)
+	// tmuxTarget is used for all post-creation tmux commands.
+	// Session mode: the session name.
+	// Window mode: "session:window" string.
+	var tmuxTarget string
+	// setEnvTarget is the session name for tmux set-environment (always session-scoped).
+	var setEnvTarget string
+
+	// 4. Create tmux session or window.
+	if cfg.WindowMode {
+		if cfg.WindowName == "" {
+			return nil, fmt.Errorf("WindowName is required when WindowMode is true")
+		}
+		target := tmux.TmuxTarget{Session: cfg.SessionID, Window: cfg.WindowName}
+		tmuxTarget = target.String()
+		setEnvTarget = cfg.SessionID
+
+		// Ensure rig session exists (create-on-first-agent per D1).
+		if exists, _ := t.HasSession(cfg.SessionID); !exists {
+			if err := t.NewSessionWithCommand(cfg.SessionID, cfg.WorkDir, command); err != nil {
+				return nil, fmt.Errorf("creating rig session: %w", err)
+			}
+			if err := t.RenameWindow(cfg.SessionID, 0, cfg.WindowName); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: renaming initial window: %v\n", err)
+			}
+		} else {
+			if err := t.NewWindowWithCommand(cfg.SessionID, cfg.WindowName, cfg.WorkDir, command); err != nil {
+				return nil, fmt.Errorf("creating window: %w", err)
+			}
+		}
+	} else {
+		tmuxTarget = cfg.SessionID
+		setEnvTarget = cfg.SessionID
+
+		if err := t.NewSessionWithCommand(cfg.SessionID, cfg.WorkDir, command); err != nil {
+			return nil, fmt.Errorf("creating session: %w", err)
+		}
 	}
 
 	// 5. Set remain-on-exit immediately if requested (before anything else can fail).
 	if cfg.RemainOnExit {
-		_ = t.SetRemainOnExit(cfg.SessionID, true)
+		_ = t.SetRemainOnExit(tmuxTarget, true)
 	}
 
 	// 6. Set environment variables.
@@ -215,28 +259,44 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		TownRoot:         cfg.TownRoot,
 		RuntimeConfigDir: cfg.RuntimeConfigDir,
 		Agent:            cfg.AgentOverride,
-		SessionName:      cfg.SessionID,
+		SessionName:      tmuxTarget,
 	})
 	envVars = MergeRuntimeLivenessEnv(envVars, runtimeConfig)
-	for _, k := range mapKeysSorted(envVars) {
-		_ = t.SetEnvironment(cfg.SessionID, k, envVars[k])
+
+	if cfg.WindowMode {
+		// In window mode, only set rig-wide (session-scoped) env vars.
+		// Identity vars (GT_ROLE, BD_ACTOR, etc.) are already baked into the
+		// command via PrependEnv and must not be set via SetEnvironment —
+		// they would leak across windows sharing the session.
+		split := config.SplitAgentEnv(envVars)
+		for _, k := range mapKeysSorted(split.SessionEnv) {
+			_ = t.SetEnvironment(setEnvTarget, k, split.SessionEnv[k])
+		}
+	} else {
+		for _, k := range mapKeysSorted(envVars) {
+			_ = t.SetEnvironment(setEnvTarget, k, envVars[k])
+		}
 	}
 	// Set GT_RUN in the session environment so respawned processes also inherit it.
-	_ = t.SetEnvironment(cfg.SessionID, "GT_RUN", runID)
+	_ = t.SetEnvironment(setEnvTarget, "GT_RUN", runID)
 	for _, k := range mapKeysSorted(cfg.ExtraEnv) {
-		_ = t.SetEnvironment(cfg.SessionID, k, cfg.ExtraEnv[k])
+		_ = t.SetEnvironment(setEnvTarget, k, cfg.ExtraEnv[k])
 	}
 
 	// 7. Apply theme.
 	if cfg.Theme != nil {
-		_ = t.ConfigureGasTownSession(cfg.SessionID, cfg.Theme, cfg.RigName, cfg.AgentName, cfg.Role)
+		_ = t.ConfigureGasTownSession(setEnvTarget, cfg.Theme, cfg.RigName, cfg.AgentName, cfg.Role)
 	}
 
 	// 8. Wait for agent to start.
 	if cfg.WaitForAgent {
-		if err := t.WaitForCommand(cfg.SessionID, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
+		if err := t.WaitForCommand(tmuxTarget, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
 			if cfg.WaitFatal {
-				_ = t.KillSessionWithProcesses(cfg.SessionID)
+				if cfg.WindowMode {
+					_ = t.KillWindow(cfg.SessionID, cfg.WindowName)
+				} else {
+					_ = t.KillSessionWithProcesses(cfg.SessionID)
+				}
 				return nil, fmt.Errorf("waiting for %s to start: %w", cfg.Role, err)
 			}
 		}
@@ -244,63 +304,73 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 
 	// 9. Auto-respawn hook.
 	if cfg.AutoRespawn {
-		if err := t.SetAutoRespawnHook(cfg.SessionID); err != nil {
+		if err := t.SetAutoRespawnHook(tmuxTarget); err != nil {
 			fmt.Printf("warning: failed to set auto-respawn hook for %s: %v\n", cfg.Role, err)
 		}
 	}
 
 	// 10. Accept startup dialogs (workspace trust + bypass permissions).
 	if cfg.AcceptBypass {
-		_ = t.AcceptStartupDialogs(cfg.SessionID)
+		_ = t.AcceptStartupDialogs(tmuxTarget)
 	}
 
 	// 11. Ready delay: wait for agent to be fully ready at the prompt.
 	// Uses prompt-based polling for agents with ReadyPromptPrefix,
 	// falling back to ReadyDelayMs sleep for agents without prompt detection.
 	if cfg.ReadyDelay {
-		if err := t.WaitForRuntimeReady(cfg.SessionID, runtimeConfig, constants.ClaudeStartTimeout); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: agent readiness detection timed out for %s: %v\n", cfg.SessionID, err)
+		if err := t.WaitForRuntimeReady(tmuxTarget, runtimeConfig, constants.ClaudeStartTimeout); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: agent readiness detection timed out for %s: %v\n", tmuxTarget, err)
 		}
 	}
 
-	// 12. Verify session survived startup.
+	// 12. Verify session/window survived startup.
 	if cfg.VerifySurvived {
-		running, err := t.HasSession(cfg.SessionID)
-		if err != nil {
-			// Clean up session on verification error to prevent orphan
-			_ = t.KillSessionWithProcesses(cfg.SessionID)
-			return nil, fmt.Errorf("verifying session: %w", err)
-		}
-		if !running {
-			return nil, fmt.Errorf("session %s died during startup (agent command may have failed)", cfg.SessionID)
+		if cfg.WindowMode {
+			alive, err := t.HasWindow(cfg.SessionID, cfg.WindowName)
+			if err != nil {
+				_ = t.KillWindow(cfg.SessionID, cfg.WindowName)
+				return nil, fmt.Errorf("verifying window: %w", err)
+			}
+			if !alive {
+				return nil, fmt.Errorf("window %s died during startup (agent command may have failed)", tmuxTarget)
+			}
+		} else {
+			running, err := t.HasSession(cfg.SessionID)
+			if err != nil {
+				_ = t.KillSessionWithProcesses(cfg.SessionID)
+				return nil, fmt.Errorf("verifying session: %w", err)
+			}
+			if !running {
+				return nil, fmt.Errorf("session %s died during startup (agent command may have failed)", cfg.SessionID)
+			}
 		}
 	}
 
 	// 13. Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
 	// Declared pane identity replaces process-tree inference in IsRuntimeRunning
 	// and FindAgentPane. Legacy sessions without GT_PANE_ID fall back to scanning.
-	if paneID, err := t.GetPaneID(cfg.SessionID); err == nil {
-		_ = t.SetEnvironment(cfg.SessionID, "GT_PANE_ID", paneID)
+	if paneID, err := t.GetPaneID(tmuxTarget); err == nil {
+		_ = t.SetEnvironment(setEnvTarget, "GT_PANE_ID", paneID)
 	}
 
 	// 14. Track PID for defense-in-depth orphan cleanup.
 	if cfg.TrackPID && cfg.TownRoot != "" {
-		_ = TrackSessionPID(cfg.TownRoot, cfg.SessionID, t)
+		_ = TrackSessionPID(cfg.TownRoot, tmuxTarget, t)
 	}
 
-	// 14. Stream agent conversation events to VictoriaLogs (opt-in).
+	// 15. Stream agent conversation events to VictoriaLogs (opt-in).
 	// Reads ~/.claude/projects/<hash>/<session>.jsonl and emits agent.event logs.
 	// Non-fatal: observability failures must never block agent startup.
 	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" && os.Getenv("GT_OTEL_LOGS_URL") != "" {
-		if err := ActivateAgentLogging(cfg.SessionID, cfg.WorkDir, runID); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: agent log watcher setup failed for %s: %v\n", cfg.SessionID, err)
+		if err := ActivateAgentLogging(tmuxTarget, cfg.WorkDir, runID); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: agent log watcher setup failed for %s: %v\n", tmuxTarget, err)
 		}
 	}
 
 	// Record the agent instantiation event (GASTA root span).
 	// Done after session creation so we only emit on success.
 	RecordAgentInstantiateFromDir(ctx, runID, runtimeConfig.ResolvedAgent,
-		cfg.Role, cfg.AgentName, cfg.SessionID, cfg.RigName, cfg.TownRoot, "", cfg.WorkDir)
+		cfg.Role, cfg.AgentName, tmuxTarget, cfg.RigName, cfg.TownRoot, "", cfg.WorkDir)
 
 	return &StartResult{RuntimeConfig: runtimeConfig, RunID: runID}, nil
 }

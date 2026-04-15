@@ -66,6 +66,22 @@ func (m *Manager) SessionName() string {
 	return session.RefinerySessionName(session.PrefixFor(m.rig.Name))
 }
 
+// Target returns the tmux target for this refinery.
+// In session mode: targets the refinery's own session.
+// In window mode: targets the refinery window in the rig session.
+func (m *Manager) Target() tmux.TmuxTarget {
+	prefix := session.PrefixFor(m.rig.Name)
+	if config.IsWindowMode(m.townRoot()) {
+		return tmux.TmuxTarget{
+			Session: session.RigSessionName(prefix),
+			Window:  session.WindowName("refinery", ""),
+		}
+	}
+	return tmux.TmuxTarget{
+		Session: m.SessionName(),
+	}
+}
+
 // IsRunning checks if the refinery session is active and healthy.
 // Checks both tmux session existence AND agent process liveness to avoid
 // reporting zombie sessions (tmux alive but Claude dead) as "running".
@@ -73,6 +89,10 @@ func (m *Manager) SessionName() string {
 // but agent liveness determines if the session is actually functional.
 func (m *Manager) IsRunning() (bool, error) {
 	t := tmux.NewTmux()
+	if config.IsWindowMode(m.townRoot()) {
+		target := m.Target()
+		return t.HasWindow(target.Session, target.Window)
+	}
 	sessionName := m.SessionName()
 	status := t.CheckSessionHealth(sessionName, 0)
 	return status == tmux.SessionHealthy, nil
@@ -112,30 +132,54 @@ func (m *Manager) Status() (*tmux.SessionInfo, error) {
 // ZFC-compliant: no state file, tmux session is source of truth.
 func (m *Manager) Start(foreground bool, agentOverride string) error {
 	t := tmux.NewTmux()
-	sessionID := m.SessionName()
+	townRoot := m.townRoot()
+	windowMode := config.IsWindowMode(townRoot)
 
 	if foreground {
 		// Foreground mode is deprecated - the Refinery agent handles merge processing
 		return fmt.Errorf("foreground mode is deprecated; use background mode (remove --foreground flag)")
 	}
 
-	// Check if session already exists
-	running, _ := t.HasSession(sessionID)
-	if running {
-		// Session exists - check if agent is actually running (healthy vs zombie)
-		if t.IsAgentAlive(sessionID) {
-			return ErrAlreadyRunning
+	// tmuxTarget is the identifier used for tmux commands after creation.
+	// Session mode: the refinery session name.
+	// Window mode: the window target (e.g., "gt-rig:refinery").
+	var tmuxTarget string
+	sessionID := m.SessionName()
+
+	if windowMode {
+		target := m.Target()
+		tmuxTarget = target.String()
+
+		// Check if refinery window already exists
+		has, _ := t.HasWindow(target.Session, target.Window)
+		if has {
+			if t.IsAgentAlive(tmuxTarget) {
+				return ErrAlreadyRunning
+			}
+			// Zombie window — kill it
+			_ = t.KillWindow(target.Session, target.Window)
 		}
-		// Zombie - tmux alive but agent dead. Kill and recreate.
-		_, _ = fmt.Fprintln(m.output, "⚠ Detected zombie session (tmux alive, agent dead). Recreating...")
-		if err := t.KillSession(sessionID); err != nil {
-			return fmt.Errorf("killing zombie session: %w", err)
+	} else {
+		tmuxTarget = sessionID
+
+		// Check if session already exists
+		running, _ := t.HasSession(sessionID)
+		if running {
+			// Session exists - check if agent is actually running (healthy vs zombie)
+			if t.IsAgentAlive(sessionID) {
+				return ErrAlreadyRunning
+			}
+			// Zombie - tmux alive but agent dead. Kill and recreate.
+			_, _ = fmt.Fprintln(m.output, "⚠ Detected zombie session (tmux alive, agent dead). Recreating...")
+			if err := t.KillSession(sessionID); err != nil {
+				return fmt.Errorf("killing zombie session: %w", err)
+			}
 		}
 	}
 
 	// Note: No PID check per ZFC - tmux session is the source of truth
 
-	// Background mode: spawn a Claude agent in a tmux session
+	// Background mode: spawn a Claude agent in a tmux session/window
 	// The Claude agent handles MR processing using git commands and beads
 
 	// Working directory is the refinery worktree (shares .git with mayor/polecats).
@@ -166,7 +210,6 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 
 	// Ensure runtime settings exist in the shared refinery parent directory.
 	// Settings are passed to Claude Code via --settings flag.
-	townRoot := filepath.Dir(m.rig.Path)
 
 	// Resolve CLAUDE_CONFIG_DIR from accounts.json so refinery sessions
 	// use the correct account. Mirrors the daemon restart path (lifecycle.go).
@@ -200,7 +243,7 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		RuntimeConfigDir: runtimeConfigDir,
 		Prompt:           initialPrompt,
 		Topic:            "patrol",
-		SessionName:      sessionID,
+		SessionName:      tmuxTarget,
 	}, m.rig.Path, initialPrompt, agentOverride)
 	if err != nil {
 		return fmt.Errorf("building startup command: %w", err)
@@ -208,12 +251,6 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 
 	// Generate the GASTA run ID for this refinery session.
 	runID := uuid.New().String()
-
-	// Create session with command directly to avoid send-keys race condition.
-	// See: https://github.com/anthropics/gastown/issues/280
-	if err := t.NewSessionWithCommand(sessionID, refineryRigDir, command); err != nil {
-		return fmt.Errorf("creating tmux session: %w", err)
-	}
 
 	// Set environment variables (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
@@ -223,60 +260,110 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		TownRoot:         townRoot,
 		RuntimeConfigDir: runtimeConfigDir,
 		Agent:            agentOverride,
-		SessionName:      sessionID,
+		SessionName:      tmuxTarget,
 	})
 	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 
 	// Add refinery-specific flag
 	envVars["GT_REFINERY"] = "1"
 
-	// Set all env vars in tmux session (for debugging) and they'll also be exported to Claude
-	for k, v := range envVars {
-		_ = t.SetEnvironment(sessionID, k, v)
+	// setEnvTarget is the session name for tmux set-environment calls.
+	// Always session-scoped (not window-scoped) since tmux environments
+	// are per-session.
+	var setEnvTarget string
+
+	if windowMode {
+		target := m.Target()
+		setEnvTarget = target.Session
+
+		// Ensure rig session exists (create-on-first-agent per D1).
+		if exists, _ := t.HasSession(target.Session); !exists {
+			// Create rig session with refinery as the initial window.
+			if err := t.NewSessionWithCommand(target.Session, refineryRigDir, command); err != nil {
+				return fmt.Errorf("creating rig session: %w", err)
+			}
+			// Rename the initial window to the refinery window name.
+			if err := t.RenameWindow(target.Session, 0, target.Window); err != nil {
+				log.Printf("warning: renaming initial window: %v", err)
+			}
+		} else {
+			// Rig session exists — add refinery as a new window.
+			if err := t.NewWindowWithCommand(target.Session, target.Window, refineryRigDir, command); err != nil {
+				return fmt.Errorf("creating refinery window: %w", err)
+			}
+		}
+
+		// In window mode, only set rig-wide (session-scoped) env vars.
+		// Identity vars (GT_ROLE, BD_ACTOR, etc.) are already baked into the
+		// command by BuildStartupCommandFromConfig and must not be set via
+		// SetEnvironment — they would leak across windows sharing the session.
+		split := config.SplitAgentEnv(envVars)
+		for k, v := range split.SessionEnv {
+			_ = t.SetEnvironment(setEnvTarget, k, v)
+		}
+	} else {
+		setEnvTarget = sessionID
+
+		// Create session with command directly to avoid send-keys race condition.
+		// See: https://github.com/anthropics/gastown/issues/280
+		if err := t.NewSessionWithCommand(sessionID, refineryRigDir, command); err != nil {
+			return fmt.Errorf("creating tmux session: %w", err)
+		}
+
+		// Session mode: set all env vars via SetEnvironment.
+		for k, v := range envVars {
+			_ = t.SetEnvironment(sessionID, k, v)
+		}
 	}
-	_ = t.SetEnvironment(sessionID, "GT_RUN", runID)
+
+	_ = t.SetEnvironment(setEnvTarget, "GT_RUN", runID)
 
 	// Apply theme (non-fatal: theming failure doesn't affect operation)
 	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "refinery", "")
-	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, "refinery", "refinery")
+	_ = t.ConfigureGasTownSession(setEnvTarget, theme, m.rig.Name, "refinery", "refinery")
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
 	// Must be before WaitForRuntimeReady to avoid race where dialog blocks prompt detection.
-	_ = t.AcceptStartupDialogs(sessionID)
+	_ = t.AcceptStartupDialogs(tmuxTarget)
 
 	// Wait for Claude to start and show its prompt - fatal if Claude fails to launch
 	// WaitForRuntimeReady waits for the runtime to be ready
-	if err := t.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout); err != nil {
-		// Kill the zombie session before returning error
-		_ = t.KillSessionWithProcesses(sessionID)
+	if err := t.WaitForRuntimeReady(tmuxTarget, runtimeConfig, constants.ClaudeStartTimeout); err != nil {
+		// Kill the zombie window/session before returning error
+		if windowMode {
+			tgt := m.Target()
+			_ = t.KillWindow(tgt.Session, tgt.Window)
+		} else {
+			_ = t.KillSessionWithProcesses(sessionID)
+		}
 		return fmt.Errorf("waiting for refinery to start: %w", err)
 	}
 
 	// Start nudge-queue poller (gt-dgf). Claude's UserPromptSubmit hook only
 	// drains when the agent submits a prompt. Idle agents never submit, so
 	// queued nudges deadlock. The poller breaks the cycle by polling every 10s.
-	if _, pollerErr := nudge.StartPoller(townRoot, sessionID); pollerErr != nil {
-		log.Printf("warning: could not start nudge poller for %s: %v", sessionID, pollerErr)
+	if _, pollerErr := nudge.StartPoller(townRoot, tmuxTarget); pollerErr != nil {
+		log.Printf("warning: could not start nudge poller for %s: %v", tmuxTarget, pollerErr)
 	}
 
-	_ = runtime.RunStartupFallback(t, sessionID, "refinery", runtimeConfig)
-	_ = runtime.DeliverStartupPromptFallback(t, sessionID, initialPrompt, runtimeConfig, constants.ClaudeStartTimeout)
+	_ = runtime.RunStartupFallback(t, tmuxTarget, "refinery", runtimeConfig)
+	_ = runtime.DeliverStartupPromptFallback(t, tmuxTarget, initialPrompt, runtimeConfig, constants.ClaudeStartTimeout)
 
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
-	if err := session.TrackSessionPID(townRoot, sessionID, t); err != nil {
-		log.Printf("warning: tracking session PID for %s: %v", sessionID, err)
+	if err := session.TrackSessionPID(townRoot, tmuxTarget, t); err != nil {
+		log.Printf("warning: tracking session PID for %s: %v", tmuxTarget, err)
 	}
 
 	// Stream refinery's Claude Code JSONL conversation log to VictoriaLogs (opt-in).
 	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" && os.Getenv("GT_OTEL_LOGS_URL") != "" {
-		if err := session.ActivateAgentLogging(sessionID, refineryRigDir, runID); err != nil {
-			log.Printf("warning: agent log watcher setup failed for %s: %v", sessionID, err)
+		if err := session.ActivateAgentLogging(tmuxTarget, refineryRigDir, runID); err != nil {
+			log.Printf("warning: agent log watcher setup failed for %s: %v", tmuxTarget, err)
 		}
 	}
 
 	// Record the agent instantiation event (GASTA root span).
 	session.RecordAgentInstantiateFromDir(context.Background(), runID, runtimeConfig.ResolvedAgent,
-		"refinery", "refinery", sessionID, m.rig.Name, townRoot, "", refineryRigDir)
+		"refinery", "refinery", tmuxTarget, m.rig.Name, townRoot, "", refineryRigDir)
 
 	return nil
 }
@@ -319,19 +406,31 @@ func (m *Manager) repairRefineryWorktree(refineryRigDir string) error {
 }
 
 // Stop stops the refinery.
-// ZFC-compliant: tmux session is the source of truth.
+// ZFC-compliant: tmux session/window is the source of truth.
 func (m *Manager) Stop() error {
 	t := tmux.NewTmux()
-	sessionID := m.SessionName()
 
-	// Check if tmux session exists
+	if config.IsWindowMode(m.townRoot()) {
+		target := m.Target()
+		has, _ := t.HasWindow(target.Session, target.Window)
+		if !has {
+			return ErrNotRunning
+		}
+		// KillWindow destroys the session if this is the last window (D1).
+		return t.KillWindow(target.Session, target.Window)
+	}
+
+	sessionID := m.SessionName()
 	running, _ := t.HasSession(sessionID)
 	if !running {
 		return ErrNotRunning
 	}
-
-	// Kill the tmux session
 	return t.KillSession(sessionID)
+}
+
+// townRoot returns the Gas Town root directory.
+func (m *Manager) townRoot() string {
+	return filepath.Dir(m.rig.Path)
 }
 
 // Queue returns the current merge queue.
