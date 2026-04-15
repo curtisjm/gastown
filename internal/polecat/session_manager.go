@@ -105,6 +105,38 @@ type SessionInfo struct {
 	LastActivity time.Time `json:"last_activity,omitempty"`
 }
 
+// Target returns the tmux target for a polecat.
+// In session mode (default): returns {Session: "gt-Toast"} (one session per polecat).
+// In window mode: returns {Session: "gt-rig", Window: "Toast"} (shared rig session).
+// The target determines how tmux operations are directed to this polecat.
+func (m *SessionManager) Target(polecat string) tmux.TmuxTarget {
+	townRoot := filepath.Dir(m.rig.Path)
+	if config.IsWindowMode(townRoot) {
+		prefix := session.PrefixFor(m.rig.Name)
+		return tmux.TmuxTarget{
+			Session: session.RigSessionName(prefix),
+			Window:  session.WindowName("polecat", polecat),
+		}
+	}
+	return tmux.TmuxTarget{
+		Session: m.SessionName(polecat),
+	}
+}
+
+// ensureRigSession creates the rig session if it doesn't already exist.
+// In window mode, all rig agents share a single tmux session. The first agent
+// to start creates the session; subsequent agents add windows to it.
+func (m *SessionManager) ensureRigSession(rigSessionName, workDir string) error {
+	exists, err := m.tmux.HasSession(rigSessionName)
+	if err != nil {
+		return fmt.Errorf("checking rig session: %w", err)
+	}
+	if exists {
+		return nil
+	}
+	return m.tmux.NewSession(rigSessionName, workDir)
+}
+
 // SessionName generates the tmux session name for a polecat.
 // Validates that the polecat name doesn't contain the rig prefix to prevent
 // double-prefix bugs (e.g., "gt-gastown_manager-gastown_manager-142").
@@ -225,21 +257,39 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 
 	sessionID := m.SessionName(polecat)
+	target := m.Target(polecat)
+	windowMode := target.IsWindow()
 
-	// Check if session already exists.
-	// If an existing session's pane process has died, kill the stale session
+	// Check if session/window already exists.
+	// If an existing session's pane process has died, kill the stale session/window
 	// and proceed rather than returning ErrSessionRunning (gt-jn40ft).
-	running, err := m.tmux.HasSession(sessionID)
-	if err != nil {
-		return fmt.Errorf("checking session: %w", err)
-	}
-	if running {
-		if m.isSessionStale(sessionID) {
-			if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
-				return fmt.Errorf("killing stale session %s: %w", sessionID, err)
+	if windowMode {
+		exists, err := m.tmux.HasWindow(target.Session, target.Window)
+		if err != nil {
+			return fmt.Errorf("checking window: %w", err)
+		}
+		if exists {
+			if m.isSessionStale(sessionID) {
+				if err := m.tmux.KillWindow(target.Session, target.Window); err != nil {
+					return fmt.Errorf("killing stale window %s: %w", target.String(), err)
+				}
+			} else {
+				return fmt.Errorf("%w: %s", ErrSessionRunning, target.String())
 			}
-		} else {
-			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+		}
+	} else {
+		running, err := m.tmux.HasSession(sessionID)
+		if err != nil {
+			return fmt.Errorf("checking session: %w", err)
+		}
+		if running {
+			if m.isSessionStale(sessionID) {
+				if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
+					return fmt.Errorf("killing stale session %s: %w", sessionID, err)
+				}
+			} else {
+				return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+			}
 		}
 	}
 
@@ -373,10 +423,32 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 	command = config.PrependEnv(command, envVarsToInject)
 
-	// Create session with command directly to avoid send-keys race condition.
+	// Create session/window with command directly to avoid send-keys race condition.
 	// See: https://github.com/anthropics/gastown/issues/280
-	if err := m.tmux.NewSessionWithCommand(sessionID, workDir, command); err != nil {
-		return fmt.Errorf("creating session: %w", err)
+	if windowMode {
+		// Window mode: ensure rig session exists, then create a named window.
+		if err := m.ensureRigSession(target.Session, workDir); err != nil {
+			return fmt.Errorf("ensuring rig session: %w", err)
+		}
+		if err := m.tmux.NewWindowWithCommand(target.Session, target.Window, workDir, command); err != nil {
+			return fmt.Errorf("creating window: %w", err)
+		}
+	} else {
+		if err := m.tmux.NewSessionWithCommand(sessionID, workDir, command); err != nil {
+			return fmt.Errorf("creating session: %w", err)
+		}
+	}
+
+	// tmuxTarget is the string used for pane-targeting operations (capture, send-keys, etc.).
+	// In session mode: "gt-Toast". In window mode: "gt-rig:Toast".
+	tmuxTarget := target.String()
+
+	// envTarget is the session name used for SetEnvironment (tmux env is session-scoped).
+	// In window mode, env vars are shared across all windows in the rig session.
+	// Per-agent identity vars are already baked into the command via PrependEnv.
+	envTarget := sessionID
+	if windowMode {
+		envTarget = target.Session
 	}
 
 	// Set environment (non-fatal: session works without these)
@@ -392,7 +464,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		SessionName:      sessionID,
 	})
 	for k, v := range envVars {
-		debugSession("SetEnvironment "+k, m.tmux.SetEnvironment(sessionID, k, v))
+		debugSession("SetEnvironment "+k, m.tmux.SetEnvironment(envTarget, k, v))
 	}
 
 	// Fallback: set GT_AGENT from resolved config when no explicit --agent override.
@@ -403,34 +475,37 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// exec env, but tmux show-environment reads the session table, not process env.
 	// This mirrors the daemon's compensating logic (daemon.go ~line 1593-1595).
 	if _, hasGTAgent := envVars["GT_AGENT"]; !hasGTAgent && runtimeConfig.ResolvedAgent != "" {
-		debugSession("SetEnvironment GT_AGENT (resolved)", m.tmux.SetEnvironment(sessionID, "GT_AGENT", runtimeConfig.ResolvedAgent))
+		debugSession("SetEnvironment GT_AGENT (resolved)", m.tmux.SetEnvironment(envTarget, "GT_AGENT", runtimeConfig.ResolvedAgent))
 	}
 
 	// Set GT_BRANCH and GT_POLECAT_PATH in tmux session environment.
-	// This ensures respawned processes also inherit these for gt done fallback.
+	// In window mode these are shared (last writer wins), but per-agent values
+	// are already injected via PrependEnv in the command string.
 	if polecatGitBranch != "" {
-		debugSession("SetEnvironment GT_BRANCH", m.tmux.SetEnvironment(sessionID, "GT_BRANCH", polecatGitBranch))
+		debugSession("SetEnvironment GT_BRANCH", m.tmux.SetEnvironment(envTarget, "GT_BRANCH", polecatGitBranch))
 	}
-	debugSession("SetEnvironment GT_POLECAT_PATH", m.tmux.SetEnvironment(sessionID, "GT_POLECAT_PATH", workDir))
-	debugSession("SetEnvironment GT_TOWN_ROOT", m.tmux.SetEnvironment(sessionID, "GT_TOWN_ROOT", townRoot))
+	debugSession("SetEnvironment GT_POLECAT_PATH", m.tmux.SetEnvironment(envTarget, "GT_POLECAT_PATH", workDir))
+	debugSession("SetEnvironment GT_TOWN_ROOT", m.tmux.SetEnvironment(envTarget, "GT_TOWN_ROOT", townRoot))
 	// Set GT_RUN in the session environment so respawned processes also inherit it.
-	debugSession("SetEnvironment GT_RUN", m.tmux.SetEnvironment(sessionID, "GT_RUN", runID))
+	debugSession("SetEnvironment GT_RUN", m.tmux.SetEnvironment(envTarget, "GT_RUN", runID))
 
 	// Disable Dolt auto-commit in tmux session environment (gt-5cc2p).
 	// This ensures respawned processes also inherit the setting.
-	debugSession("SetEnvironment BD_DOLT_AUTO_COMMIT", m.tmux.SetEnvironment(sessionID, "BD_DOLT_AUTO_COMMIT", "off"))
+	debugSession("SetEnvironment BD_DOLT_AUTO_COMMIT", m.tmux.SetEnvironment(envTarget, "BD_DOLT_AUTO_COMMIT", "off"))
 
 	// Set GT_PROCESS_NAMES for accurate liveness detection. Custom agents may
 	// shadow built-in preset names (e.g., custom "codex" running "opencode"),
 	// so we resolve process names from both agent name and actual command.
 	processNames := config.ResolveProcessNames(runtimeConfig.ResolvedAgent, runtimeConfig.Command)
-	debugSession("SetEnvironment GT_PROCESS_NAMES", m.tmux.SetEnvironment(sessionID, "GT_PROCESS_NAMES", strings.Join(processNames, ",")))
+	debugSession("SetEnvironment GT_PROCESS_NAMES", m.tmux.SetEnvironment(envTarget, "GT_PROCESS_NAMES", strings.Join(processNames, ",")))
 
 	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
-	// Declared pane identity replaces process-tree inference in IsRuntimeRunning
-	// and FindAgentPane. Legacy sessions without GT_PANE_ID fall back to scanning.
-	if paneID, err := m.tmux.GetPaneID(sessionID); err == nil {
-		debugSession("SetEnvironment GT_PANE_ID", m.tmux.SetEnvironment(sessionID, "GT_PANE_ID", paneID))
+	// In window mode, GT_PANE_ID is session-scoped and would be overwritten by
+	// each new window — skip it. Per-window liveness comes with Phase 7.
+	if !windowMode {
+		if paneID, err := m.tmux.GetPaneID(sessionID); err == nil {
+			debugSession("SetEnvironment GT_PANE_ID", m.tmux.SetEnvironment(sessionID, "GT_PANE_ID", paneID))
+		}
 	}
 
 	// Hook the issue to the polecat if provided via --issue flag
@@ -441,24 +516,32 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		}
 	}
 
-	// Apply theme (non-fatal)
-	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "polecat", polecat)
-	debugSession("ConfigureGasTownSession", m.tmux.ConfigureGasTownSession(sessionID, theme, m.rig.Name, polecat, "polecat"))
+	// Apply theme and session config (non-fatal).
+	// In window mode, session-level theming is configured once for the rig session
+	// (Phase 5). Per-window theming is not yet implemented.
+	if !windowMode {
+		theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "polecat", polecat)
+		debugSession("ConfigureGasTownSession", m.tmux.ConfigureGasTownSession(sessionID, theme, m.rig.Name, polecat, "polecat"))
+	}
 
-	// Set pane-died hook for crash detection (non-fatal)
+	// Set pane-died hook for crash detection (non-fatal).
+	// In window mode, per-window hooks (set-hook -w) come with Phase 7.
 	agentID := fmt.Sprintf("%s/%s", m.rig.Name, polecat)
-	debugSession("SetPaneDiedHook", m.tmux.SetPaneDiedHook(sessionID, agentID))
+	if !windowMode {
+		debugSession("SetPaneDiedHook", m.tmux.SetPaneDiedHook(sessionID, agentID))
+	}
 
-	// Wait for Claude to start (non-fatal)
-	debugSession("WaitForCommand", m.tmux.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout))
+	// Wait for Claude to start (non-fatal).
+	// tmuxTarget works for both modes: "gt-Toast" or "gt-rig:Toast".
+	debugSession("WaitForCommand", m.tmux.WaitForCommand(tmuxTarget, constants.SupportedShells, constants.ClaudeStartTimeout))
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear
-	debugSession("AcceptStartupDialogs", m.tmux.AcceptStartupDialogs(sessionID))
+	debugSession("AcceptStartupDialogs", m.tmux.AcceptStartupDialogs(tmuxTarget))
 
 	// Wait for runtime to be fully ready at the prompt (not just started).
 	// Uses prompt-based polling for agents with ReadyPromptPrefix (e.g., Claude "❯ "),
 	// falling back to ReadyDelayMs sleep for agents without prompt detection.
-	debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
+	debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(tmuxTarget, runtimeConfig, constants.ClaudeStartTimeout))
 
 	// Handle fallback nudges for non-hook agents.
 	// See StartupFallbackInfo in runtime package for the fallback matrix.
@@ -466,19 +549,19 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		// Promptless runtimes need the full startup prompt delivered via nudge so
 		// the agent sees both the beacon and the initial work instructions.
 		debugSession("DeliverStartupPromptFallback",
-			runtime.DeliverStartupPromptFallback(m.tmux, sessionID, startupPromptFallback, runtimeConfig, constants.ClaudeStartTimeout))
+			runtime.DeliverStartupPromptFallback(m.tmux, tmuxTarget, startupPromptFallback, runtimeConfig, constants.ClaudeStartTimeout))
 	} else {
 		if fallbackInfo.StartupNudgeDelayMs > 0 {
 			// Wait for agent to finish processing the beacon + gt prime before sending
 			// work instructions. Prompt-capable runtimes already got the beacon as the
 			// initial CLI prompt, so they only need the delayed startup nudge here.
 			primeWaitRC := runtime.RuntimeConfigWithMinDelay(runtimeConfig, fallbackInfo.StartupNudgeDelayMs)
-			debugSession("WaitForPrimeReady", m.tmux.WaitForRuntimeReady(sessionID, primeWaitRC, constants.ClaudeStartTimeout))
+			debugSession("WaitForPrimeReady", m.tmux.WaitForRuntimeReady(tmuxTarget, primeWaitRC, constants.ClaudeStartTimeout))
 		}
 
 		if fallbackInfo.SendStartupNudge {
 			// Send work instructions via nudge
-			debugSession("SendStartupNudge", m.tmux.NudgeSession(sessionID, startupNudgeContent))
+			debugSession("SendStartupNudge", m.tmux.NudgeSession(tmuxTarget, startupNudgeContent))
 		}
 	}
 
@@ -490,32 +573,46 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		if fallbackInfo.SendBeaconNudge {
 			verifyContent = startupPromptFallback
 		}
-		m.verifyStartupNudgeDelivery(sessionID, runtimeConfig, verifyContent)
+		m.verifyStartupNudgeDelivery(tmuxTarget, runtimeConfig, verifyContent)
 	}
 
 	// Legacy fallback for other startup paths (non-fatal)
-	_ = runtime.RunStartupFallback(m.tmux, sessionID, "polecat", runtimeConfig)
+	_ = runtime.RunStartupFallback(m.tmux, tmuxTarget, "polecat", runtimeConfig)
 
-	// Verify session survived startup - if the command crashed, the session may have died.
+	// Verify session/window survived startup - if the command crashed, it may have died.
 	// Without this check, Start() would return success even if the pane died during initialization.
-	running, err = m.tmux.HasSession(sessionID)
-	if err != nil {
-		return fmt.Errorf("verifying session: %w", err)
-	}
-	if !running {
-		return fmt.Errorf("session %s died during startup (agent command may have failed)", sessionID)
+	if windowMode {
+		survived, verifyErr := m.tmux.HasWindow(target.Session, target.Window)
+		if verifyErr != nil {
+			return fmt.Errorf("verifying window: %w", verifyErr)
+		}
+		if !survived {
+			return fmt.Errorf("window %s died during startup (agent command may have failed)", target.String())
+		}
+	} else {
+		survived, verifyErr := m.tmux.HasSession(sessionID)
+		if verifyErr != nil {
+			return fmt.Errorf("verifying session: %w", verifyErr)
+		}
+		if !survived {
+			return fmt.Errorf("session %s died during startup (agent command may have failed)", sessionID)
+		}
 	}
 
 	// Validate GT_AGENT is set. Without GT_AGENT, IsAgentAlive falls back to
 	// ["node", "claude"] process detection and witness patrol will auto-nuke
 	// polecats running non-Claude agents (e.g., opencode). Fail fast.
-	gtAgent, _ := m.tmux.GetEnvironment(sessionID, "GT_AGENT")
+	gtAgent, _ := m.tmux.GetEnvironment(envTarget, "GT_AGENT")
 	if gtAgent == "" {
-		_ = m.tmux.KillSessionWithProcesses(sessionID)
+		if windowMode {
+			_ = m.tmux.KillWindow(target.Session, target.Window)
+		} else {
+			_ = m.tmux.KillSessionWithProcesses(sessionID)
+		}
 		return fmt.Errorf("GT_AGENT not set in session %s (command=%q); "+
 			"witness patrol will misidentify this polecat as a zombie and auto-nuke it. "+
 			"Ensure RuntimeConfig.ResolvedAgent is set during agent config resolution",
-			sessionID, runtimeConfig.Command)
+			envTarget, runtimeConfig.Command)
 	}
 
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
@@ -548,8 +645,34 @@ func (m *SessionManager) isSessionStale(sessionID string) bool {
 	return isSessionProcessDead(m.tmux, sessionID, filepath.Dir(m.rig.Path))
 }
 
-// Stop terminates a polecat session.
+// Stop terminates a polecat session or window.
 func (m *SessionManager) Stop(polecat string, force bool) error {
+	target := m.Target(polecat)
+
+	if target.IsWindow() {
+		// Window mode: check and kill the window.
+		exists, err := m.tmux.HasWindow(target.Session, target.Window)
+		if err != nil {
+			return fmt.Errorf("checking window: %w", err)
+		}
+		if !exists {
+			return ErrSessionNotFound
+		}
+
+		// Try graceful shutdown first
+		if !force {
+			_ = m.tmux.SendKeysRaw(target.String(), "C-c")
+			time.Sleep(constants.GracefulShutdownTimeout)
+		}
+
+		// KillWindow destroys the window (and the session if it's the last one).
+		if err := m.tmux.KillWindow(target.Session, target.Window); err != nil {
+			return fmt.Errorf("killing window: %w", err)
+		}
+		return nil
+	}
+
+	// Session mode: existing behavior.
 	sessionID := m.SessionName(polecat)
 
 	running, err := m.tmux.HasSession(sessionID)
@@ -575,10 +698,23 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 	return nil
 }
 
-// IsRunning checks if a polecat session is active and healthy.
-// Checks both tmux session existence AND agent process liveness to avoid
+// IsRunning checks if a polecat session/window is active and healthy.
+// Checks both tmux session/window existence AND agent process liveness to avoid
 // reporting zombie sessions (tmux alive but Claude dead) as "running".
 func (m *SessionManager) IsRunning(polecat string) (bool, error) {
+	target := m.Target(polecat)
+	if target.IsWindow() {
+		// Window mode: check if the window exists in the rig session.
+		exists, err := m.tmux.HasWindow(target.Session, target.Window)
+		if err != nil || !exists {
+			return false, err
+		}
+		// Window exists. Full per-window health checking (agent liveness)
+		// comes with Phase 7 daemon integration.
+		return true, nil
+	}
+
+	// Session mode: existing health check.
 	sessionID := m.SessionName(polecat)
 	status := m.tmux.CheckSessionHealth(sessionID, 0)
 	return status == tmux.SessionHealthy, nil
@@ -586,31 +722,49 @@ func (m *SessionManager) IsRunning(polecat string) (bool, error) {
 
 // Status returns detailed status for a polecat session.
 func (m *SessionManager) Status(polecat string) (*SessionInfo, error) {
+	target := m.Target(polecat)
 	sessionID := m.SessionName(polecat)
 
-	running, err := m.tmux.HasSession(sessionID)
-	if err != nil {
-		return nil, fmt.Errorf("checking session: %w", err)
+	var isRunning bool
+	if target.IsWindow() {
+		exists, err := m.tmux.HasWindow(target.Session, target.Window)
+		if err != nil {
+			return nil, fmt.Errorf("checking window: %w", err)
+		}
+		isRunning = exists
+	} else {
+		exists, err := m.tmux.HasSession(sessionID)
+		if err != nil {
+			return nil, fmt.Errorf("checking session: %w", err)
+		}
+		isRunning = exists
 	}
 
 	info := &SessionInfo{
 		Polecat:   polecat,
-		SessionID: sessionID,
-		Running:   running,
+		SessionID: target.String(),
+		Running:   isRunning,
 		RigName:   m.rig.Name,
 	}
 
-	if !running {
+	if !isRunning {
 		return info, nil
 	}
 
-	tmuxInfo, err := m.tmux.GetSessionInfo(sessionID)
+	// GetSessionInfo is session-scoped; in window mode we get rig session info.
+	sessionForInfo := sessionID
+	if target.IsWindow() {
+		sessionForInfo = target.Session
+	}
+	tmuxInfo, err := m.tmux.GetSessionInfo(sessionForInfo)
 	if err != nil {
 		return info, nil
 	}
 
 	info.Attached = tmuxInfo.Attached
-	info.Windows = tmuxInfo.Windows
+	if !target.IsWindow() {
+		info.Windows = tmuxInfo.Windows
+	}
 
 	if tmuxInfo.Created != "" {
 		formats := []string{
@@ -642,6 +796,15 @@ func (m *SessionManager) Status(polecat string) (*SessionInfo, error) {
 // This includes polecats, witness, refinery, and crew sessions.
 // Use ListPolecats() to get only polecat sessions.
 func (m *SessionManager) List() ([]SessionInfo, error) {
+	townRoot := filepath.Dir(m.rig.Path)
+	if config.IsWindowMode(townRoot) {
+		return m.listWindows()
+	}
+	return m.listSessions()
+}
+
+// listSessions returns session-mode agents for this rig.
+func (m *SessionManager) listSessions() ([]SessionInfo, error) {
 	sessions, err := m.tmux.ListSessions()
 	if err != nil {
 		return nil, err
@@ -667,8 +830,30 @@ func (m *SessionManager) List() ([]SessionInfo, error) {
 	return infos, nil
 }
 
+// listWindows returns window-mode agents for this rig.
+func (m *SessionManager) listWindows() ([]SessionInfo, error) {
+	prefix := session.PrefixFor(m.rig.Name)
+	rigSession := session.RigSessionName(prefix)
+
+	windows, err := m.tmux.ListWindows(rigSession)
+	if err != nil {
+		return nil, err
+	}
+
+	var infos []SessionInfo
+	for _, windowName := range windows {
+		infos = append(infos, SessionInfo{
+			Polecat:   windowName,
+			SessionID: fmt.Sprintf("%s:%s", rigSession, windowName),
+			Running:   true,
+			RigName:   m.rig.Name,
+		})
+	}
+	return infos, nil
+}
+
 // ListPolecats returns information only about polecat sessions for this rig.
-// Filters out witness, refinery, and crew sessions.
+// Filters out witness, refinery, and crew sessions/windows.
 func (m *SessionManager) ListPolecats() ([]SessionInfo, error) {
 	infos, err := m.List()
 	if err != nil {
@@ -677,7 +862,7 @@ func (m *SessionManager) ListPolecats() ([]SessionInfo, error) {
 
 	var filtered []SessionInfo
 	for _, info := range infos {
-		// Skip non-polecat sessions
+		// Skip non-polecat sessions/windows
 		if info.Polecat == "witness" || info.Polecat == "refinery" || strings.HasPrefix(info.Polecat, "crew-") {
 			continue
 		}
@@ -687,10 +872,25 @@ func (m *SessionManager) ListPolecats() ([]SessionInfo, error) {
 	return filtered, nil
 }
 
-// Attach attaches to a polecat session.
+// Attach attaches to a polecat session. In window mode, selects the polecat's
+// window first, then attaches to the rig session.
 func (m *SessionManager) Attach(polecat string) error {
-	sessionID := m.SessionName(polecat)
+	target := m.Target(polecat)
 
+	if target.IsWindow() {
+		exists, err := m.tmux.HasWindow(target.Session, target.Window)
+		if err != nil {
+			return fmt.Errorf("checking window: %w", err)
+		}
+		if !exists {
+			return ErrSessionNotFound
+		}
+		// Attach to the rig session with the window selected.
+		// tmux attach-session -t session:window selects the window and attaches.
+		return m.tmux.AttachSession(target.String())
+	}
+
+	sessionID := m.SessionName(polecat)
 	running, err := m.tmux.HasSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
@@ -704,8 +904,20 @@ func (m *SessionManager) Attach(polecat string) error {
 
 // Capture returns the recent output from a polecat session.
 func (m *SessionManager) Capture(polecat string, lines int) (string, error) {
-	sessionID := m.SessionName(polecat)
+	target := m.Target(polecat)
 
+	if target.IsWindow() {
+		exists, err := m.tmux.HasWindow(target.Session, target.Window)
+		if err != nil {
+			return "", fmt.Errorf("checking window: %w", err)
+		}
+		if !exists {
+			return "", ErrSessionNotFound
+		}
+		return m.tmux.CapturePane(target.String(), lines)
+	}
+
+	sessionID := m.SessionName(polecat)
 	running, err := m.tmux.HasSession(sessionID)
 	if err != nil {
 		return "", fmt.Errorf("checking session: %w", err)
@@ -718,8 +930,14 @@ func (m *SessionManager) Capture(polecat string, lines int) (string, error) {
 }
 
 // CaptureSession returns the recent output from a session by raw session ID.
+// This method accepts a raw tmux target (session or session:window).
 func (m *SessionManager) CaptureSession(sessionID string, lines int) (string, error) {
-	running, err := m.tmux.HasSession(sessionID)
+	// For session:window targets, check the session part exists.
+	sessionName := sessionID
+	if idx := strings.Index(sessionID, ":"); idx >= 0 {
+		sessionName = sessionID[:idx]
+	}
+	running, err := m.tmux.HasSession(sessionName)
 	if err != nil {
 		return "", fmt.Errorf("checking session: %w", err)
 	}
@@ -732,8 +950,25 @@ func (m *SessionManager) CaptureSession(sessionID string, lines int) (string, er
 
 // Inject sends a message to a polecat session.
 func (m *SessionManager) Inject(polecat, message string) error {
-	sessionID := m.SessionName(polecat)
+	target := m.Target(polecat)
 
+	if target.IsWindow() {
+		exists, err := m.tmux.HasWindow(target.Session, target.Window)
+		if err != nil {
+			return fmt.Errorf("checking window: %w", err)
+		}
+		if !exists {
+			return ErrSessionNotFound
+		}
+
+		debounceMs := 200 + (len(message)/1024)*100
+		if debounceMs > 1500 {
+			debounceMs = 1500
+		}
+		return m.tmux.SendKeysDebounced(target.String(), message, debounceMs)
+	}
+
+	sessionID := m.SessionName(polecat)
 	running, err := m.tmux.HasSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)

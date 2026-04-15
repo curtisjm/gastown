@@ -644,3 +644,340 @@ func TestPolecatSlot(t *testing.T) {
 		t.Errorf("with hidden dir: polecatSlot(beta) = %d, want 1", slot)
 	}
 }
+
+// enableWindowMode creates town settings with window_mode=true in the given town root.
+// Returns a cleanup function that removes the settings.
+func enableWindowMode(t *testing.T, townRoot string) {
+	t.Helper()
+	settingsPath := config.TownSettingsPath(townRoot)
+	settings := config.NewTownSettings()
+	settings.WindowMode = true
+	if err := config.SaveTownSettings(settingsPath, settings); err != nil {
+		t.Fatalf("enabling window mode: %v", err)
+	}
+	t.Cleanup(func() { os.Remove(settingsPath) })
+}
+
+func TestTargetSessionMode(t *testing.T) {
+	setupTestRegistryForSession(t)
+
+	// No window mode config → session mode target.
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{
+		Name:     "gastown",
+		Path:     rigPath,
+		Polecats: []string{"Toast"},
+	}
+	m := NewSessionManager(tmux.NewTmux(), r)
+
+	target := m.Target("Toast")
+	if target.Session != "gt-Toast" {
+		t.Errorf("Target().Session = %q, want %q", target.Session, "gt-Toast")
+	}
+	if target.Window != "" {
+		t.Errorf("Target().Window = %q, want empty", target.Window)
+	}
+	if target.IsWindow() {
+		t.Error("Target().IsWindow() = true in session mode, want false")
+	}
+	if target.String() != "gt-Toast" {
+		t.Errorf("Target().String() = %q, want %q", target.String(), "gt-Toast")
+	}
+}
+
+func TestTargetWindowMode(t *testing.T) {
+	setupTestRegistryForSession(t)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	enableWindowMode(t, townRoot)
+
+	r := &rig.Rig{
+		Name:     "gastown",
+		Path:     rigPath,
+		Polecats: []string{"Toast"},
+	}
+	m := NewSessionManager(tmux.NewTmux(), r)
+
+	target := m.Target("Toast")
+	if target.Session != "gt-rig" {
+		t.Errorf("Target().Session = %q, want %q", target.Session, "gt-rig")
+	}
+	if target.Window != "Toast" {
+		t.Errorf("Target().Window = %q, want %q", target.Window, "Toast")
+	}
+	if !target.IsWindow() {
+		t.Error("Target().IsWindow() = false in window mode, want true")
+	}
+	if target.String() != "gt-rig:Toast" {
+		t.Errorf("Target().String() = %q, want %q", target.String(), "gt-rig:Toast")
+	}
+}
+
+func TestIsRunningWindowMode_NoRigSession(t *testing.T) {
+	requireTmux(t)
+	setupTestRegistryForSession(t)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	enableWindowMode(t, townRoot)
+
+	r := &rig.Rig{
+		Name:     "gastown",
+		Path:     rigPath,
+		Polecats: []string{"Toast"},
+	}
+	m := NewSessionManager(tmux.NewTmux(), r)
+
+	running, err := m.IsRunning("Toast")
+	if err != nil {
+		t.Fatalf("IsRunning: %v", err)
+	}
+	if running {
+		t.Error("IsRunning = true when rig session doesn't exist, want false")
+	}
+}
+
+func TestStopWindowMode_NotFound(t *testing.T) {
+	requireTmux(t)
+	setupTestRegistryForSession(t)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	enableWindowMode(t, townRoot)
+
+	r := &rig.Rig{
+		Name:     "gastown",
+		Path:     rigPath,
+		Polecats: []string{"Toast"},
+	}
+	m := NewSessionManager(tmux.NewTmux(), r)
+
+	err := m.Stop("Toast", false)
+	if err != ErrSessionNotFound {
+		t.Errorf("Stop = %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestCaptureWindowMode_NotFound(t *testing.T) {
+	requireTmux(t)
+	setupTestRegistryForSession(t)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	enableWindowMode(t, townRoot)
+
+	r := &rig.Rig{
+		Name:     "gastown",
+		Path:     rigPath,
+		Polecats: []string{"Toast"},
+	}
+	m := NewSessionManager(tmux.NewTmux(), r)
+
+	_, err := m.Capture("Toast", 50)
+	if err != ErrSessionNotFound {
+		t.Errorf("Capture = %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestInjectWindowMode_NotFound(t *testing.T) {
+	requireTmux(t)
+	setupTestRegistryForSession(t)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	enableWindowMode(t, townRoot)
+
+	r := &rig.Rig{
+		Name:     "gastown",
+		Path:     rigPath,
+		Polecats: []string{"Toast"},
+	}
+	m := NewSessionManager(tmux.NewTmux(), r)
+
+	err := m.Inject("Toast", "hello")
+	if err != ErrSessionNotFound {
+		t.Errorf("Inject = %v, want ErrSessionNotFound", err)
+	}
+}
+
+// TestWindowModeLifecycle tests the full window lifecycle:
+// create rig session, add polecat window, verify running, capture, stop.
+func TestWindowModeLifecycle(t *testing.T) {
+	requireTmux(t)
+	setupTestRegistryForSession(t)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(filepath.Join(rigPath, "polecats", "Toast"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	enableWindowMode(t, townRoot)
+
+	tm := tmux.NewTmux()
+	r := &rig.Rig{
+		Name:     "gastown",
+		Path:     rigPath,
+		Polecats: []string{"Toast"},
+	}
+	m := NewSessionManager(tm, r)
+
+	// Verify target is window mode
+	target := m.Target("Toast")
+	if !target.IsWindow() {
+		t.Fatal("expected window mode target")
+	}
+
+	rigSession := target.Session
+	t.Cleanup(func() { _ = tm.KillSession(rigSession) })
+
+	// Create rig session and polecat window manually (simulating Start's core behavior)
+	if err := tm.NewSession(rigSession, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := tm.NewWindowWithCommand(rigSession, target.Window, os.TempDir(), "sleep 60"); err != nil {
+		t.Fatalf("NewWindowWithCommand: %v", err)
+	}
+
+	// IsRunning should detect the window
+	running, err := m.IsRunning("Toast")
+	if err != nil {
+		t.Fatalf("IsRunning: %v", err)
+	}
+	if !running {
+		t.Error("IsRunning = false after creating window, want true")
+	}
+
+	// Capture should work via window target
+	output, err := m.Capture("Toast", 10)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	// Just verify it returns without error; content depends on tmux timing
+	_ = output
+
+	// List should include the polecat
+	infos, err := m.ListPolecats()
+	if err != nil {
+		t.Fatalf("ListPolecats: %v", err)
+	}
+	found := false
+	for _, info := range infos {
+		if info.Polecat == "Toast" {
+			found = true
+			if info.SessionID != "gt-rig:Toast" {
+				t.Errorf("SessionID = %q, want %q", info.SessionID, "gt-rig:Toast")
+			}
+		}
+	}
+	if !found {
+		t.Error("ListPolecats did not include Toast")
+	}
+
+	// Stop should kill the window
+	if err := m.Stop("Toast", true); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// IsRunning should return false after stop
+	running, err = m.IsRunning("Toast")
+	if err != nil {
+		t.Fatalf("IsRunning after stop: %v", err)
+	}
+	if running {
+		t.Error("IsRunning = true after Stop, want false")
+	}
+}
+
+// TestListWindowMode_FiltersNonPolecats verifies that ListPolecats in window mode
+// correctly filters out witness, refinery, and crew windows.
+func TestListWindowMode_FiltersNonPolecats(t *testing.T) {
+	requireTmux(t)
+	setupTestRegistryForSession(t)
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	enableWindowMode(t, townRoot)
+
+	tm := tmux.NewTmux()
+	prefix := session.PrefixFor("gastown")
+	rigSession := session.RigSessionName(prefix)
+	t.Cleanup(func() { _ = tm.KillSession(rigSession) })
+
+	// Create rig session with multiple windows
+	if err := tm.NewSession(rigSession, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	for _, name := range []string{"witness", "refinery", "crew-jack", "Toast", "Cheedo"} {
+		if err := tm.NewWindowWithCommand(rigSession, name, os.TempDir(), "sleep 60"); err != nil {
+			t.Fatalf("NewWindowWithCommand(%s): %v", name, err)
+		}
+	}
+
+	r := &rig.Rig{
+		Name:     "gastown",
+		Path:     rigPath,
+		Polecats: []string{"Toast", "Cheedo"},
+	}
+	m := NewSessionManager(tm, r)
+
+	// List should include all windows
+	allInfos, err := m.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	// Should have the initial default window + our 5 named windows
+	if len(allInfos) < 5 {
+		t.Errorf("List returned %d entries, want at least 5", len(allInfos))
+	}
+
+	// ListPolecats should exclude witness, refinery, crew
+	polecats, err := m.ListPolecats()
+	if err != nil {
+		t.Fatalf("ListPolecats: %v", err)
+	}
+
+	polecatNames := make(map[string]bool)
+	for _, info := range polecats {
+		polecatNames[info.Polecat] = true
+	}
+
+	if polecatNames["witness"] {
+		t.Error("ListPolecats should not include 'witness'")
+	}
+	if polecatNames["refinery"] {
+		t.Error("ListPolecats should not include 'refinery'")
+	}
+	if polecatNames["crew-jack"] {
+		t.Error("ListPolecats should not include 'crew-jack'")
+	}
+	if !polecatNames["Toast"] {
+		t.Error("ListPolecats should include 'Toast'")
+	}
+	if !polecatNames["Cheedo"] {
+		t.Error("ListPolecats should include 'Cheedo'")
+	}
+}
