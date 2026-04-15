@@ -1605,17 +1605,13 @@ func runRigBoot(cmd *cobra.Command, args []string) error {
 	var started []string
 	var skipped []string
 
-	t := tmux.NewTmux()
-
 	// 1. Start the witness
-	// Check actual tmux session, not state file (may be stale)
-	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
-	witnessRunning, _ := t.HasSession(witnessSession)
-	if witnessRunning {
+	// Use manager IsRunning which handles both session and window mode.
+	witMgr := witness.NewManager(r)
+	if witnessRunning, _ := witMgr.IsRunning(); witnessRunning {
 		skipped = append(skipped, "witness (already running)")
 	} else {
 		fmt.Printf("  Starting witness...\n")
-		witMgr := witness.NewManager(r)
 		if err := witMgr.Start(false, "", nil); err != nil {
 			if err == witness.ErrAlreadyRunning {
 				skipped = append(skipped, "witness (already running)")
@@ -1628,14 +1624,12 @@ func runRigBoot(cmd *cobra.Command, args []string) error {
 	}
 
 	// 2. Start the refinery
-	// Check actual tmux session, not state file (may be stale)
-	refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
-	refineryRunning, _ := t.HasSession(refinerySession)
-	if refineryRunning {
+	// Use manager IsRunning which handles both session and window mode.
+	refMgr := refinery.NewManager(r)
+	if refineryRunning, _ := refMgr.IsRunning(); refineryRunning {
 		skipped = append(skipped, "refinery (already running)")
 	} else {
 		fmt.Printf("  Starting refinery...\n")
-		refMgr := refinery.NewManager(r)
 		if err := refMgr.Start(false, ""); err != nil { // false = background mode
 			return fmt.Errorf("starting refinery: %w", err)
 		}
@@ -1669,7 +1663,6 @@ func runRigStart(cmd *cobra.Command, args []string) error {
 
 	g := git.NewGit(townRoot)
 	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
-	t := tmux.NewTmux()
 
 	var successRigs []string
 	var failedRigs []string
@@ -1696,13 +1689,12 @@ func runRigStart(cmd *cobra.Command, args []string) error {
 		hasError := false
 
 		// 1. Start the witness
-		witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
-		witnessRunning, _ := t.HasSession(witnessSession)
-		if witnessRunning {
+		// Use manager IsRunning which handles both session and window mode.
+		witMgr := witness.NewManager(r)
+		if witnessRunning, _ := witMgr.IsRunning(); witnessRunning {
 			skipped = append(skipped, "witness")
 		} else {
 			fmt.Printf("  Starting witness...\n")
-			witMgr := witness.NewManager(r)
 			if err := witMgr.Start(false, "", nil); err != nil {
 				if err == witness.ErrAlreadyRunning {
 					skipped = append(skipped, "witness")
@@ -1716,13 +1708,12 @@ func runRigStart(cmd *cobra.Command, args []string) error {
 		}
 
 		// 2. Start the refinery
-		refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
-		refineryRunning, _ := t.HasSession(refinerySession)
-		if refineryRunning {
+		// Use manager IsRunning which handles both session and window mode.
+		refMgr := refinery.NewManager(r)
+		if refineryRunning, _ := refMgr.IsRunning(); refineryRunning {
 			skipped = append(skipped, "refinery")
 		} else {
 			fmt.Printf("  Starting refinery...\n")
-			refMgr := refinery.NewManager(r)
 			if err := refMgr.Start(false, ""); err != nil {
 				fmt.Printf("  %s Failed to start refinery: %v\n", style.Warning.Render("⚠"), err)
 				hasError = true
@@ -1789,10 +1780,24 @@ func runRigShutdown(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Shutting down rig %s...\n", style.Bold.Render(rigName))
 
+	t := tmux.NewTmux()
+
+	// Window mode: one KillSession stops all agents sharing the rig session.
+	if config.IsWindowMode(townRoot) {
+		rigSession := session.RigSessionName(session.PrefixFor(rigName))
+		if exists, _ := t.HasSession(rigSession); exists {
+			fmt.Printf("  Killing rig session %s (all agent windows)...\n", rigSession)
+			if err := t.KillSessionWithProcesses(rigSession); err != nil {
+				return fmt.Errorf("killing rig session: %w", err)
+			}
+		}
+		fmt.Printf("%s Rig %s shut down successfully\n", style.Success.Render("✓"), rigName)
+		return nil
+	}
+
+	// Session mode: stop agents individually.
 	var errors []string
 
-	// 1. Stop all polecat sessions
-	t := tmux.NewTmux()
 	polecatMgr := polecat.NewSessionManager(t, r)
 	infos, err := polecatMgr.ListPolecats()
 	if err == nil && len(infos) > 0 {
@@ -1802,7 +1807,6 @@ func runRigShutdown(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 2. Stop the refinery
 	refMgr := refinery.NewManager(r)
 	if running, _ := refMgr.IsRunning(); running {
 		fmt.Printf("  Stopping refinery...\n")
@@ -1811,7 +1815,6 @@ func runRigShutdown(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 3. Stop the witness
 	witMgr := witness.NewManager(r)
 	if running, _ := witMgr.IsRunning(); running {
 		fmt.Printf("  Stopping witness...\n")
@@ -2103,10 +2106,13 @@ func runRigStop(cmd *cobra.Command, args []string) error {
 
 	g := git.NewGit(townRoot)
 	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
+	windowMode := config.IsWindowMode(townRoot)
 
 	// Track results
 	var succeeded []string
 	var failed []string
+
+	t := tmux.NewTmux()
 
 	// Process each rig
 	for _, rigName := range args {
@@ -2125,10 +2131,25 @@ func runRigStop(cmd *cobra.Command, args []string) error {
 
 		fmt.Printf("Stopping rig %s...\n", style.Bold.Render(rigName))
 
+		// Window mode: one KillSession stops all agents sharing the rig session.
+		if windowMode {
+			rigSession := session.RigSessionName(session.PrefixFor(rigName))
+			if exists, _ := t.HasSession(rigSession); exists {
+				fmt.Printf("  Killing rig session %s (all agent windows)...\n", rigSession)
+				if err := t.KillSessionWithProcesses(rigSession); err != nil {
+					fmt.Printf("%s Failed to kill rig session: %v\n", style.Warning.Render("⚠"), err)
+					failed = append(failed, rigName)
+					continue
+				}
+			}
+			fmt.Printf("%s Rig %s stopped\n", style.Success.Render("✓"), rigName)
+			succeeded = append(succeeded, rigName)
+			continue
+		}
+
+		// Session mode: stop agents individually.
 		var errors []string
 
-		// 1. Stop all polecat sessions
-		t := tmux.NewTmux()
 		polecatMgr := polecat.NewSessionManager(t, r)
 		infos, err := polecatMgr.ListPolecats()
 		if err == nil && len(infos) > 0 {
@@ -2138,7 +2159,6 @@ func runRigStop(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// 2. Stop the refinery
 		refMgr := refinery.NewManager(r)
 		if running, _ := refMgr.IsRunning(); running {
 			fmt.Printf("  Stopping refinery...\n")
@@ -2147,7 +2167,6 @@ func runRigStop(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// 3. Stop the witness
 		witMgr := witness.NewManager(r)
 		if running, _ := witMgr.IsRunning(); running {
 			fmt.Printf("  Stopping witness...\n")
@@ -2202,6 +2221,7 @@ func runRigRestart(cmd *cobra.Command, args []string) error {
 	g := git.NewGit(townRoot)
 	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
 	t := tmux.NewTmux()
+	windowMode := config.IsWindowMode(townRoot)
 
 	// Track results
 	var succeeded []string
@@ -2224,46 +2244,61 @@ func runRigRestart(cmd *cobra.Command, args []string) error {
 
 		fmt.Printf("Restarting rig %s...\n", style.Bold.Render(rigName))
 
-		var stopErrors []string
-		var startErrors []string
-
 		// === STOP PHASE ===
 		fmt.Printf("  Stopping...\n")
 
-		// 1. Stop all polecat sessions
-		polecatMgr := polecat.NewSessionManager(t, r)
-		infos, err := polecatMgr.ListPolecats()
-		if err == nil && len(infos) > 0 {
-			fmt.Printf("    Stopping %d polecat session(s)...\n", len(infos))
-			if err := polecatMgr.StopAll(rigRestartForce); err != nil {
-				stopErrors = append(stopErrors, fmt.Sprintf("polecat sessions: %v", err))
+		stopFailed := false
+		if windowMode {
+			// Window mode: one KillSession stops all agents sharing the rig session.
+			rigSession := session.RigSessionName(session.PrefixFor(rigName))
+			if exists, _ := t.HasSession(rigSession); exists {
+				fmt.Printf("    Killing rig session %s (all agent windows)...\n", rigSession)
+				if err := t.KillSessionWithProcesses(rigSession); err != nil {
+					fmt.Printf("  %s Failed to kill rig session: %v\n", style.Warning.Render("⚠"), err)
+					failed = append(failed, rigName)
+					stopFailed = true
+				}
+			}
+		} else {
+			// Session mode: stop agents individually.
+			var stopErrors []string
+
+			polecatMgr := polecat.NewSessionManager(t, r)
+			infos, err := polecatMgr.ListPolecats()
+			if err == nil && len(infos) > 0 {
+				fmt.Printf("    Stopping %d polecat session(s)...\n", len(infos))
+				if err := polecatMgr.StopAll(rigRestartForce); err != nil {
+					stopErrors = append(stopErrors, fmt.Sprintf("polecat sessions: %v", err))
+				}
+			}
+
+			refMgr := refinery.NewManager(r)
+			if running, _ := refMgr.IsRunning(); running {
+				fmt.Printf("    Stopping refinery...\n")
+				if err := refMgr.Stop(); err != nil {
+					stopErrors = append(stopErrors, fmt.Sprintf("refinery: %v", err))
+				}
+			}
+
+			witMgr := witness.NewManager(r)
+			if running, _ := witMgr.IsRunning(); running {
+				fmt.Printf("    Stopping witness...\n")
+				if err := witMgr.Stop(); err != nil {
+					stopErrors = append(stopErrors, fmt.Sprintf("witness: %v", err))
+				}
+			}
+
+			if len(stopErrors) > 0 {
+				fmt.Printf("  %s Stop errors:\n", style.Warning.Render("⚠"))
+				for _, e := range stopErrors {
+					fmt.Printf("    - %s\n", e)
+				}
+				failed = append(failed, rigName)
+				stopFailed = true
 			}
 		}
 
-		// 2. Stop the refinery
-		refMgr := refinery.NewManager(r)
-		if running, _ := refMgr.IsRunning(); running {
-			fmt.Printf("    Stopping refinery...\n")
-			if err := refMgr.Stop(); err != nil {
-				stopErrors = append(stopErrors, fmt.Sprintf("refinery: %v", err))
-			}
-		}
-
-		// 3. Stop the witness
-		witMgr := witness.NewManager(r)
-		if running, _ := witMgr.IsRunning(); running {
-			fmt.Printf("    Stopping witness...\n")
-			if err := witMgr.Stop(); err != nil {
-				stopErrors = append(stopErrors, fmt.Sprintf("witness: %v", err))
-			}
-		}
-
-		if len(stopErrors) > 0 {
-			fmt.Printf("  %s Stop errors:\n", style.Warning.Render("⚠"))
-			for _, e := range stopErrors {
-				fmt.Printf("    - %s\n", e)
-			}
-			failed = append(failed, rigName)
+		if stopFailed {
 			continue
 		}
 
@@ -2272,11 +2307,12 @@ func runRigRestart(cmd *cobra.Command, args []string) error {
 
 		var started []string
 		var skipped []string
+		var startErrors []string
 
 		// 1. Start the witness
-		witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
-		witnessRunning, _ := t.HasSession(witnessSession)
-		if witnessRunning {
+		// Use manager IsRunning which handles both session and window mode.
+		witMgr := witness.NewManager(r)
+		if witnessRunning, _ := witMgr.IsRunning(); witnessRunning {
 			skipped = append(skipped, "witness")
 		} else {
 			fmt.Printf("    Starting witness...\n")
@@ -2293,9 +2329,9 @@ func runRigRestart(cmd *cobra.Command, args []string) error {
 		}
 
 		// 2. Start the refinery
-		refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
-		refineryRunning, _ := t.HasSession(refinerySession)
-		if refineryRunning {
+		// Use manager IsRunning which handles both session and window mode.
+		refMgr := refinery.NewManager(r)
+		if refineryRunning, _ := refMgr.IsRunning(); refineryRunning {
 			skipped = append(skipped, "refinery")
 		} else {
 			fmt.Printf("    Starting refinery...\n")

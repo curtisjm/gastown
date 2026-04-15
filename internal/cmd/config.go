@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,7 +15,9 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -744,6 +747,13 @@ func runConfigSet(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("invalid value for %s: %w (expected true/false)", key, err)
 		}
+		// Guard: warn if switching modes with running agents.
+		if b != townSettings.WindowMode {
+			if rigs := findRigsWithRunningAgents(townRoot, b); len(rigs) > 0 {
+				return fmt.Errorf("cannot switch window_mode while agents are running in: %s\nStop them first with: gt rig stop %s",
+					strings.Join(rigs, ", "), strings.Join(rigs, " "))
+			}
+		}
 		townSettings.WindowMode = b
 
 	case "scheduler.max_polecats":
@@ -1316,4 +1326,46 @@ config values such as the default AI model or provider.`,
 
 	// Register with root
 	rootCmd.AddCommand(configCmd)
+}
+
+// findRigsWithRunningAgents checks all registered rigs for running tmux
+// sessions/windows. switchingToWindow indicates the target mode — when true,
+// we look for session-mode agents; when false, for window-mode rig sessions.
+func findRigsWithRunningAgents(townRoot string, switchingToWindow bool) []string {
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigsConfig, err := config.LoadRigsConfig(rigsPath)
+	if err != nil {
+		return nil
+	}
+
+	t := tmux.NewTmux()
+	var running []string
+
+	for rigName, entry := range rigsConfig.Rigs {
+		prefix := session.DefaultPrefix
+		if entry.BeadsConfig != nil && entry.BeadsConfig.Prefix != "" {
+			prefix = entry.BeadsConfig.Prefix
+		}
+
+		if switchingToWindow {
+			// Currently in session mode — check for per-agent sessions.
+			if has, _ := t.HasSession(session.WitnessSessionName(prefix)); has {
+				running = append(running, rigName)
+				continue
+			}
+			if has, _ := t.HasSession(session.RefinerySessionName(prefix)); has {
+				running = append(running, rigName)
+				continue
+			}
+		} else {
+			// Currently in window mode — check for rig session.
+			if has, _ := t.HasSession(session.RigSessionName(prefix)); has {
+				running = append(running, rigName)
+				continue
+			}
+		}
+	}
+
+	sort.Strings(running)
+	return running
 }
