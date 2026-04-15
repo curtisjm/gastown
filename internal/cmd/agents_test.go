@@ -629,3 +629,156 @@ func TestGuessSessionFromWorkerDir(t *testing.T) {
 		})
 	}
 }
+
+// --- Window mode tests ---
+
+func TestParseRigSession(t *testing.T) {
+	setupCmdTestRegistry(t)
+
+	tests := []struct {
+		name    string
+		input   string
+		wantRig string
+		wantOK  bool
+	}{
+		{"gastown rig session", "gt-rig", "gastown", true},
+		{"myrig rig session", "mr-rig", "myrig", true},
+		{"not a rig session", "gt-witness", "", false},
+		{"polecat session", "gt-furiosa", "", false},
+		{"mayor", "hq-mayor", "", false},
+		{"bare rig suffix", "rig", "", false},
+		{"unregistered prefix", "zz-rig", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rig, ok := parseRigSession(tt.input)
+			if ok != tt.wantOK {
+				t.Errorf("parseRigSession(%q) ok = %v, want %v", tt.input, ok, tt.wantOK)
+			}
+			if rig != tt.wantRig {
+				t.Errorf("parseRigSession(%q) rig = %q, want %q", tt.input, rig, tt.wantRig)
+			}
+		})
+	}
+}
+
+func TestCategorizeWindow(t *testing.T) {
+	tests := []struct {
+		name      string
+		session   string
+		window    string
+		rig       string
+		wantType  AgentType
+		wantAgent string
+	}{
+		{"witness window", "gt-rig", "witness", "gastown", AgentWitness, ""},
+		{"refinery window", "gt-rig", "refinery", "gastown", AgentRefinery, ""},
+		{"crew window", "gt-rig", "crew-max", "gastown", AgentCrew, "max"},
+		{"polecat window", "gt-rig", "furiosa", "gastown", AgentPolecat, "furiosa"},
+		{"polecat window nux", "gt-rig", "nux", "gastown", AgentPolecat, "nux"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := categorizeWindow(tt.session, tt.window, tt.rig)
+			if got == nil {
+				t.Fatal("categorizeWindow returned nil")
+			}
+			if got.Type != tt.wantType {
+				t.Errorf("Type = %d, want %d", got.Type, tt.wantType)
+			}
+			if got.AgentName != tt.wantAgent {
+				t.Errorf("AgentName = %q, want %q", got.AgentName, tt.wantAgent)
+			}
+			if got.Rig != tt.rig {
+				t.Errorf("Rig = %q, want %q", got.Rig, tt.rig)
+			}
+			if got.Window != tt.window {
+				t.Errorf("Window = %q, want %q", got.Window, tt.window)
+			}
+			if got.Name != tt.session {
+				t.Errorf("Name = %q, want %q", got.Name, tt.session)
+			}
+		})
+	}
+}
+
+func TestAgentSession_Target(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent AgentSession
+		want  string
+	}{
+		{"session mode", AgentSession{Name: "gt-witness"}, "gt-witness"},
+		{"window mode", AgentSession{Name: "gt-rig", Window: "witness"}, "gt-rig:witness"},
+		{"window polecat", AgentSession{Name: "gt-rig", Window: "furiosa"}, "gt-rig:furiosa"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.agent.target()
+			if got != tt.want {
+				t.Errorf("target() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildMenuAction_WindowTarget(t *testing.T) {
+	action := buildMenuAction("gt", "gt-rig:witness")
+	if !strings.Contains(action, "gt-rig:witness") {
+		t.Errorf("window target action should contain 'gt-rig:witness', got: %s", action)
+	}
+	if !strings.Contains(action, "-L gt") {
+		t.Errorf("window target action should use -L gt, got: %s", action)
+	}
+}
+
+func TestFilterAndSortSessions_RigSessionPassthrough(t *testing.T) {
+	setupCmdTestRegistry(t)
+
+	input := []string{
+		"hq-mayor",
+		"gt-rig",
+		"gt-witness",
+	}
+
+	got := filterAndSortSessions(input, false)
+
+	hasRig := false
+	for _, a := range got {
+		if a.Name == "gt-rig" {
+			hasRig = true
+		}
+	}
+	if !hasRig {
+		names := make([]string, len(got))
+		for i, a := range got {
+			names[i] = a.Name
+		}
+		t.Errorf("rig session 'gt-rig' should pass through filterAndSortSessions, got: %v", names)
+	}
+}
+
+func TestDisplayLabel_WindowModeAgents(t *testing.T) {
+	tests := []struct {
+		name        string
+		agent       AgentSession
+		wantContain string
+	}{
+		{"window witness", AgentSession{Name: "gt-rig", Type: AgentWitness, Rig: "gastown", Window: "witness"}, "gastown/witness"},
+		{"window refinery", AgentSession{Name: "gt-rig", Type: AgentRefinery, Rig: "gastown", Window: "refinery"}, "gastown/refinery"},
+		{"window crew", AgentSession{Name: "gt-rig", Type: AgentCrew, Rig: "gastown", AgentName: "max", Window: "crew-max"}, "crew/max"},
+		{"window polecat", AgentSession{Name: "gt-rig", Type: AgentPolecat, Rig: "gastown", AgentName: "furiosa", Window: "furiosa"}, "furiosa"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			label := tt.agent.displayLabel()
+			if !strings.Contains(label, tt.wantContain) {
+				t.Errorf("displayLabel() = %q, want substring %q", label, tt.wantContain)
+			}
+		})
+	}
+}

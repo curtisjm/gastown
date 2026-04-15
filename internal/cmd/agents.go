@@ -39,6 +39,17 @@ type AgentSession struct {
 	Rig       string // For rig-specific agents
 	AgentName string // e.g., crew name, polecat name
 	Socket    string // tmux socket name this session lives on
+	Window    string // Window name within a rig session (window mode only)
+}
+
+// target returns the tmux target string for switching to this agent.
+// For session-mode agents: the session name.
+// For window-mode agents: "session:window".
+func (a *AgentSession) target() string {
+	if a.Window != "" {
+		return fmt.Sprintf("%s:%s", a.Name, a.Window)
+	}
+	return a.Name
 }
 
 // AgentTypeColors maps agent types to tmux color codes.
@@ -181,6 +192,49 @@ func categorizeSession(name string) *AgentSession {
 	return sess
 }
 
+// parseRigSession returns the rig name if the session name matches the
+// window-mode rig session pattern (<prefix>-rig), e.g. "gt-rig" → "gastown".
+func parseRigSession(name string) (rigName string, ok bool) {
+	registry := session.DefaultRegistry()
+	for _, prefix := range registry.Prefixes() {
+		candidate := prefix + "-rig"
+		if name == candidate {
+			return registry.RigForPrefix(prefix), true
+		}
+	}
+	return "", false
+}
+
+// categorizeWindow converts a window name within a rig session into an AgentSession.
+// Window names are set by session.WindowName(role, name):
+//   - "witness" → AgentWitness
+//   - "refinery" → AgentRefinery
+//   - "crew-<name>" → AgentCrew with AgentName
+//   - anything else → AgentPolecat with AgentName
+func categorizeWindow(rigSession, window, rig string) *AgentSession {
+	sess := &AgentSession{
+		Name:   rigSession,
+		Rig:    rig,
+		Window: window,
+	}
+
+	switch {
+	case window == "witness":
+		sess.Type = AgentWitness
+	case window == "refinery":
+		sess.Type = AgentRefinery
+	case strings.HasPrefix(window, "crew-"):
+		sess.Type = AgentCrew
+		sess.AgentName = window[5:] // len("crew-") = 5
+	default:
+		// Polecats use their name as the window name
+		sess.Type = AgentPolecat
+		sess.AgentName = window
+	}
+
+	return sess
+}
+
 // getAgentSessions returns all categorized Gas Town sessions from the town socket.
 func getAgentSessions(includePolecats bool) ([]*AgentSession, error) {
 	t := tmux.NewTmux()
@@ -188,7 +242,65 @@ func getAgentSessions(includePolecats bool) ([]*AgentSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	return filterAndSortSessions(sessions, includePolecats), nil
+	agents := filterAndSortSessions(sessions, includePolecats)
+	agents = expandRigSessions(t, agents, includePolecats)
+	return agents, nil
+}
+
+// expandRigSessions replaces rig session placeholders (window-mode "<prefix>-rig"
+// sessions) with individual AgentSession entries for each window in the rig
+// session. Non-rig agents pass through unchanged.
+func expandRigSessions(t *tmux.Tmux, agents []*AgentSession, includePolecats bool) []*AgentSession {
+	var result []*AgentSession
+	for _, agent := range agents {
+		rigName, ok := parseRigSession(agent.Name)
+		if !ok {
+			result = append(result, agent)
+			continue
+		}
+		// Enumerate windows in this rig session
+		windows, err := t.ListWindows(agent.Name)
+		if err != nil || len(windows) == 0 {
+			continue
+		}
+		for _, win := range windows {
+			wa := categorizeWindow(agent.Name, win, rigName)
+			wa.Socket = agent.Socket
+			if wa.Type == AgentPolecat && !includePolecats {
+				continue
+			}
+			result = append(result, wa)
+		}
+	}
+	// Re-sort since we replaced rig entries with expanded windows
+	sort.Slice(result, func(i, j int) bool {
+		return agentLess(result[i], result[j])
+	})
+	return result
+}
+
+// agentLess defines the canonical sort order for agent sessions:
+// mayor, deacon first, then by rig, then by type within rig, then alphabetical.
+func agentLess(a, b *AgentSession) bool {
+	if a.Type == AgentMayor {
+		return true
+	}
+	if b.Type == AgentMayor {
+		return false
+	}
+	if a.Type == AgentDeacon {
+		return true
+	}
+	if b.Type == AgentDeacon {
+		return false
+	}
+	if a.Rig != b.Rig {
+		return a.Rig < b.Rig
+	}
+	if rigTypeOrder[a.Type] != rigTypeOrder[b.Type] {
+		return rigTypeOrder[a.Type] < rigTypeOrder[b.Type]
+	}
+	return a.AgentName < b.AgentName
 }
 
 // socketGroup holds sessions for a single tmux socket.
@@ -253,6 +365,7 @@ func getAllSocketSessions(includePolecats bool) []socketGroup {
 		for _, a := range agents {
 			a.Socket = townSocket
 		}
+		agents = expandRigSessions(townTmux, agents, includePolecats)
 		if len(agents) > 0 {
 			groups = append(groups, socketGroup{Socket: townSocket, Sessions: agents})
 		}
@@ -310,6 +423,14 @@ func getAllSocketSessions(includePolecats bool) []socketGroup {
 func filterAndSortSessions(sessionNames []string, includePolecats bool) []*AgentSession {
 	var agents []*AgentSession
 	for _, name := range sessionNames {
+		// Check for rig sessions (window mode) before parsing as regular session.
+		// Rig sessions like "gt-rig" would parse as polecats with name "rig",
+		// but they need to pass through to expandRigSessions for window enumeration.
+		if _, ok := parseRigSession(name); ok {
+			agents = append(agents, &AgentSession{Name: name})
+			continue
+		}
+
 		agent := categorizeSession(name)
 		if agent == nil {
 			continue
@@ -326,34 +447,7 @@ func filterAndSortSessions(sessionNames []string, includePolecats bool) []*Agent
 
 	// Sort: mayor, deacon first, then by rig, then by type
 	sort.Slice(agents, func(i, j int) bool {
-		a, b := agents[i], agents[j]
-
-		// Town-level agents first
-		if a.Type == AgentMayor {
-			return true
-		}
-		if b.Type == AgentMayor {
-			return false
-		}
-		if a.Type == AgentDeacon {
-			return true
-		}
-		if b.Type == AgentDeacon {
-			return false
-		}
-
-		// Then by rig name
-		if a.Rig != b.Rig {
-			return a.Rig < b.Rig
-		}
-
-		// Within rig: refinery, witness, crew, polecat
-		if rigTypeOrder[a.Type] != rigTypeOrder[b.Type] {
-			return rigTypeOrder[a.Type] < rigTypeOrder[b.Type]
-		}
-
-		// Same type: alphabetical by agent name
-		return a.AgentName < b.AgentName
+		return agentLess(agents[i], agents[j])
 	})
 
 	return agents
@@ -516,7 +610,7 @@ func runAgents(cmd *cobra.Command, args []string) error {
 
 			key := shortcutKey(keyIndex)
 			label := agent.displayLabel()
-			action := buildMenuAction(agent.Socket, agent.Name)
+			action := buildMenuAction(agent.Socket, agent.target())
 
 			menuArgs = append(menuArgs, label, key, action)
 			keyIndex++
