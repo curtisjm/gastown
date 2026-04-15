@@ -415,6 +415,26 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 	return env
 }
 
+// AgentEnvSplit contains environment variables split by scope for window mode.
+// In window mode, CommandEnv vars must be baked into the command string via
+// PrependEnv because tmux set-environment is session-scoped and identity vars
+// would leak across windows sharing a session. SessionEnv vars are rig-wide
+// and safe for tmux set-environment.
+type AgentEnvSplit struct {
+	CommandEnv map[string]string // Per-agent identity vars
+	SessionEnv map[string]string // Rig-wide vars safe for session scope
+}
+
+// SplitAgentEnv separates the output of AgentEnv into command-scoped and
+// session-scoped categories. Identity vars (GT_ROLE, BD_ACTOR, etc.) go
+// into CommandEnv; everything else into SessionEnv.
+func SplitAgentEnv(env map[string]string) AgentEnvSplit {
+	return AgentEnvSplit{
+		CommandEnv: FilterEnv(env, IdentityEnvVars...),
+		SessionEnv: WithoutEnv(env, IdentityEnvVars...),
+	}
+}
+
 // sanitizeOTELAttrValue prepares a string for use as a value in OTEL_RESOURCE_ATTRIBUTES.
 // It takes the first line only, replaces commas (which break key=value,key=value parsing),
 // and truncates to maxLen bytes.

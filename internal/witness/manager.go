@@ -49,6 +49,10 @@ func NewManager(r *rig.Rig) *Manager {
 // but agent liveness determines if the session is actually functional.
 func (m *Manager) IsRunning() (bool, error) {
 	t := tmux.NewTmux()
+	if config.IsWindowMode(m.townRoot()) {
+		target := m.Target()
+		return t.HasWindow(target.Session, target.Window)
+	}
 	status := t.CheckSessionHealth(m.SessionName(), 0)
 	return status == tmux.SessionHealthy, nil
 }
@@ -66,6 +70,22 @@ func (m *Manager) IsHealthy(maxInactivity time.Duration) tmux.ZombieStatus {
 // SessionName returns the tmux session name for this witness.
 func (m *Manager) SessionName() string {
 	return session.WitnessSessionName(session.PrefixFor(m.rig.Name))
+}
+
+// Target returns the tmux target for this witness.
+// In session mode: targets the witness's own session.
+// In window mode: targets the witness window in the rig session.
+func (m *Manager) Target() tmux.TmuxTarget {
+	prefix := session.PrefixFor(m.rig.Name)
+	if config.IsWindowMode(m.townRoot()) {
+		return tmux.TmuxTarget{
+			Session: session.RigSessionName(prefix),
+			Window:  session.WindowName("witness", ""),
+		}
+	}
+	return tmux.TmuxTarget{
+		Session: m.SessionName(),
+	}
 }
 
 // Status returns information about the witness session.
@@ -109,45 +129,67 @@ func (m *Manager) witnessDir() string {
 // ZFC-compliant: no state file, tmux session is source of truth.
 func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []string) error {
 	t := tmux.NewTmux()
-	sessionID := m.SessionName()
+	townRoot := m.townRoot()
+	windowMode := config.IsWindowMode(townRoot)
 
 	if foreground {
 		// Foreground mode is deprecated - patrol logic moved to mol-witness-patrol
 		return fmt.Errorf("foreground mode is deprecated; use background mode (remove --foreground flag)")
 	}
 
-	// Check if session already exists
-	running, _ := t.HasSession(sessionID)
-	if running {
-		// Session exists - check if Claude is actually running (healthy vs zombie)
-		if t.IsAgentAlive(sessionID) {
-			// Healthy - Claude is running
-			return ErrAlreadyRunning
-		}
-		// Zombie detected — tmux alive but agent dead.
-		// Mitigate TOCTOU gap: the agent may be slow to start, appearing
-		// dead during initialization. Record session creation time, wait
-		// briefly, then re-verify before killing to avoid destroying a
-		// session that just became healthy.
-		createdAt, _ := t.GetSessionCreatedUnix(sessionID)
-		time.Sleep(constants.ZombieKillGracePeriod)
+	// tmuxTarget is the identifier used for tmux commands after creation.
+	// Session mode: the witness session name (e.g., "gt-witness").
+	// Window mode: the window target (e.g., "gt-rig:witness").
+	var tmuxTarget string
+	sessionID := m.SessionName()
 
-		// Re-check: abort kill if agent started or session was replaced
-		if t.IsAgentAlive(sessionID) {
-			return ErrAlreadyRunning
-		}
-		if createdNow, _ := t.GetSessionCreatedUnix(sessionID); createdAt > 0 && createdNow != createdAt {
-			// Session was replaced between checks — another process already
-			// handled the zombie. Treat as already running; caller can retry.
-			return ErrAlreadyRunning
-		}
+	if windowMode {
+		target := m.Target()
+		tmuxTarget = target.String()
 
-		if err := t.KillSession(sessionID); err != nil {
-			return fmt.Errorf("killing zombie session: %w", err)
+		// Check if witness window already exists
+		has, _ := t.HasWindow(target.Session, target.Window)
+		if has {
+			if t.IsAgentAlive(tmuxTarget) {
+				return ErrAlreadyRunning
+			}
+			// Zombie window — kill it
+			_ = t.KillWindow(target.Session, target.Window)
+		}
+	} else {
+		tmuxTarget = sessionID
+
+		// Check if session already exists
+		running, _ := t.HasSession(sessionID)
+		if running {
+			// Session exists - check if Claude is actually running (healthy vs zombie)
+			if t.IsAgentAlive(sessionID) {
+				// Healthy - Claude is running
+				return ErrAlreadyRunning
+			}
+			// Zombie detected — tmux alive but agent dead.
+			// Mitigate TOCTOU gap: the agent may be slow to start, appearing
+			// dead during initialization. Record session creation time, wait
+			// briefly, then re-verify before killing to avoid destroying a
+			// session that just became healthy.
+			createdAt, _ := t.GetSessionCreatedUnix(sessionID)
+			time.Sleep(constants.ZombieKillGracePeriod)
+
+			// Re-check: abort kill if agent started or session was replaced
+			if t.IsAgentAlive(sessionID) {
+				return ErrAlreadyRunning
+			}
+			if createdNow, _ := t.GetSessionCreatedUnix(sessionID); createdAt > 0 && createdNow != createdAt {
+				// Session was replaced between checks — another process already
+				// handled the zombie. Treat as already running; caller can retry.
+				return ErrAlreadyRunning
+			}
+
+			if err := t.KillSession(sessionID); err != nil {
+				return fmt.Errorf("killing zombie session: %w", err)
+			}
 		}
 	}
-
-	// Note: No PID check per ZFC - tmux session is the source of truth
 
 	// Working directory
 	witnessDir := m.witnessDir()
@@ -157,7 +199,6 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	// ResolveRoleAgentConfig is internally serialized (resolveConfigMu in
 	// package config) to prevent concurrent rig starts from corrupting the
 	// global agent registry.
-	townRoot := m.townRoot()
 
 	// Resolve CLAUDE_CONFIG_DIR from accounts.json so witness sessions
 	// use the correct account. Mirrors the daemon restart path (lifecycle.go).
@@ -189,19 +230,13 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	// NOTE: No gt prime injection needed - SessionStart hook handles it automatically
 	// Export GT_ROLE and BD_ACTOR in the command since tmux SetEnvironment only affects new panes
 	// Pass m.rig.Path so rig agent settings are honored (not town-level defaults)
-	command, err := buildWitnessStartCommand(m.rig.Path, m.rig.Name, townRoot, sessionID, agentOverride, roleConfig, runtimeConfigDir)
+	command, err := buildWitnessStartCommand(m.rig.Path, m.rig.Name, townRoot, tmuxTarget, agentOverride, roleConfig, runtimeConfigDir)
 	if err != nil {
 		return err
 	}
 
 	// Generate the GASTA run ID for this witness session.
 	runID := uuid.New().String()
-
-	// Create session with command directly to avoid send-keys race condition.
-	// See: https://github.com/anthropics/gastown/issues/280
-	if err := t.NewSessionWithCommand(sessionID, witnessDir, command); err != nil {
-		return fmt.Errorf("creating tmux session: %w", err)
-	}
 
 	// Set environment variables (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
@@ -211,13 +246,60 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		TownRoot:         townRoot,
 		RuntimeConfigDir: runtimeConfigDir,
 		Agent:            agentOverride,
-		SessionName:      sessionID,
+		SessionName:      tmuxTarget,
 	})
 	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
-	for k, v := range envVars {
-		_ = t.SetEnvironment(sessionID, k, v)
+
+	// setEnvTarget is the session name for tmux set-environment calls.
+	// Always session-scoped (not window-scoped) since tmux environments
+	// are per-session.
+	var setEnvTarget string
+
+	if windowMode {
+		target := m.Target()
+		setEnvTarget = target.Session
+
+		// Ensure rig session exists (create-on-first-agent per D1).
+		if exists, _ := t.HasSession(target.Session); !exists {
+			// Create rig session with witness as the initial window.
+			if err := t.NewSessionWithCommand(target.Session, witnessDir, command); err != nil {
+				return fmt.Errorf("creating rig session: %w", err)
+			}
+			// Rename the initial window to the witness window name.
+			if err := t.RenameWindow(target.Session, 0, target.Window); err != nil {
+				log.Printf("warning: renaming initial window: %v", err)
+			}
+		} else {
+			// Rig session exists — add witness as a new window.
+			if err := t.NewWindowWithCommand(target.Session, target.Window, witnessDir, command); err != nil {
+				return fmt.Errorf("creating witness window: %w", err)
+			}
+		}
+
+		// In window mode, only set rig-wide (session-scoped) env vars.
+		// Identity vars (GT_ROLE, BD_ACTOR, etc.) are already baked into the
+		// command by BuildStartupCommandFromConfig and must not be set via
+		// SetEnvironment — they would leak across windows sharing the session.
+		split := config.SplitAgentEnv(envVars)
+		for k, v := range split.SessionEnv {
+			_ = t.SetEnvironment(setEnvTarget, k, v)
+		}
+	} else {
+		setEnvTarget = sessionID
+
+		// Create session with command directly to avoid send-keys race condition.
+		// See: https://github.com/anthropics/gastown/issues/280
+		if err := t.NewSessionWithCommand(sessionID, witnessDir, command); err != nil {
+			return fmt.Errorf("creating tmux session: %w", err)
+		}
+
+		// Session mode: set all env vars via SetEnvironment.
+		for k, v := range envVars {
+			_ = t.SetEnvironment(sessionID, k, v)
+		}
 	}
-	_ = t.SetEnvironment(sessionID, "GT_RUN", runID)
+
+	_ = t.SetEnvironment(setEnvTarget, "GT_RUN", runID)
 	// Apply role config env vars if present (non-fatal).
 	// Skip keys already set by AgentEnv to prevent TOML env overriding
 	// the canonical qualified GT_ROLE (e.g., "gastown/witness" not "witness").
@@ -226,61 +308,66 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		if _, alreadySet := envVars[key]; alreadySet {
 			continue
 		}
-		_ = t.SetEnvironment(sessionID, key, value)
+		_ = t.SetEnvironment(setEnvTarget, key, value)
 	}
 	// Apply CLI env overrides (highest priority, non-fatal).
 	for _, override := range envOverrides {
 		if key, value, ok := strings.Cut(override, "="); ok {
-			_ = t.SetEnvironment(sessionID, key, value)
+			_ = t.SetEnvironment(setEnvTarget, key, value)
 		}
 	}
 
 	// Apply Gas Town theming (non-fatal: theming failure doesn't affect operation)
 	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "witness", "")
-	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, "witness", "witness")
+	_ = t.ConfigureGasTownSession(setEnvTarget, theme, m.rig.Name, "witness", "witness")
 
 	// Wait for Claude to start - fatal if Claude fails to launch
-	if err := t.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
-		// Kill the zombie session before returning error
-		_ = t.KillSessionWithProcesses(sessionID)
+	if err := t.WaitForCommand(tmuxTarget, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
+		// Kill the zombie window/session before returning error
+		if windowMode {
+			tgt := m.Target()
+			_ = t.KillWindow(tgt.Session, tgt.Window)
+		} else {
+			_ = t.KillSessionWithProcesses(sessionID)
+		}
 		return fmt.Errorf("waiting for witness to start: %w", err)
 	}
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
-	if err := t.AcceptStartupDialogs(sessionID); err != nil {
-		log.Printf("warning: accepting startup dialogs for %s: %v", sessionID, err)
+	if err := t.AcceptStartupDialogs(tmuxTarget); err != nil {
+		log.Printf("warning: accepting startup dialogs for %s: %v", tmuxTarget, err)
 	}
 
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
-	if err := session.TrackSessionPID(townRoot, sessionID, t); err != nil {
-		log.Printf("warning: tracking session PID for %s: %v", sessionID, err)
+	if err := session.TrackSessionPID(townRoot, tmuxTarget, t); err != nil {
+		log.Printf("warning: tracking session PID for %s: %v", tmuxTarget, err)
 	}
 
 	// Start nudge-queue poller (gt-dgf). Claude's UserPromptSubmit hook only
 	// drains when the agent submits a prompt. Idle agents never submit, so
 	// queued nudges deadlock. The poller breaks the cycle by polling every 10s.
-	if _, pollerErr := nudge.StartPoller(townRoot, sessionID); pollerErr != nil {
-		log.Printf("warning: could not start nudge poller for %s: %v", sessionID, pollerErr)
+	if _, pollerErr := nudge.StartPoller(townRoot, tmuxTarget); pollerErr != nil {
+		log.Printf("warning: could not start nudge poller for %s: %v", tmuxTarget, pollerErr)
 	}
 
-	_ = runtime.RunStartupFallback(t, sessionID, "witness", runtimeConfig)
+	_ = runtime.RunStartupFallback(t, tmuxTarget, "witness", runtimeConfig)
 	initialPrompt := session.BuildStartupPrompt(session.BeaconConfig{
 		Recipient: session.BeaconRecipient("witness", "", m.rig.Name),
 		Sender:    "deacon",
 		Topic:     "patrol",
 	}, "Run `gt prime --hook` and begin patrol.")
-	_ = runtime.DeliverStartupPromptFallback(t, sessionID, initialPrompt, runtimeConfig, constants.ClaudeStartTimeout)
+	_ = runtime.DeliverStartupPromptFallback(t, tmuxTarget, initialPrompt, runtimeConfig, constants.ClaudeStartTimeout)
 
 	// Stream witness's Claude Code JSONL conversation log to VictoriaLogs (opt-in).
 	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" && os.Getenv("GT_OTEL_LOGS_URL") != "" {
-		if err := session.ActivateAgentLogging(sessionID, witnessDir, runID); err != nil {
-			log.Printf("warning: agent log watcher setup failed for %s: %v", sessionID, err)
+		if err := session.ActivateAgentLogging(tmuxTarget, witnessDir, runID); err != nil {
+			log.Printf("warning: agent log watcher setup failed for %s: %v", tmuxTarget, err)
 		}
 	}
 
 	// Record the agent instantiation event (GASTA root span).
 	session.RecordAgentInstantiateFromDir(context.Background(), runID, runtimeConfig.ResolvedAgent,
-		"witness", "witness", sessionID, m.rig.Name, townRoot, "", witnessDir)
+		"witness", "witness", tmuxTarget, m.rig.Name, townRoot, "", witnessDir)
 
 	time.Sleep(constants.ShutdownNotifyDelay)
 
@@ -376,17 +463,24 @@ func isBuiltinClaudeStartCommand(cmd string) bool {
 }
 
 // Stop stops the witness.
-// ZFC-compliant: tmux session is the source of truth.
+// ZFC-compliant: tmux session/window is the source of truth.
 func (m *Manager) Stop() error {
 	t := tmux.NewTmux()
-	sessionID := m.SessionName()
 
-	// Check if tmux session exists
+	if config.IsWindowMode(m.townRoot()) {
+		target := m.Target()
+		has, _ := t.HasWindow(target.Session, target.Window)
+		if !has {
+			return ErrNotRunning
+		}
+		// KillWindow destroys the session if this is the last window (D1).
+		return t.KillWindow(target.Session, target.Window)
+	}
+
+	sessionID := m.SessionName()
 	running, _ := t.HasSession(sessionID)
 	if !running {
 		return ErrNotRunning
 	}
-
-	// Kill the tmux session
 	return t.KillSession(sessionID)
 }

@@ -1314,3 +1314,45 @@ func TestAgentEnv_EffortLevel(t *testing.T) {
 		}
 	})
 }
+
+func TestSplitAgentEnv(t *testing.T) {
+	t.Parallel()
+	env := AgentEnv(AgentEnvConfig{
+		Role:     "witness",
+		Rig:      "myrig",
+		TownRoot: "/town",
+	})
+	split := SplitAgentEnv(env)
+
+	// Identity vars should be in CommandEnv
+	assertEnv(t, split.CommandEnv, "GT_ROLE", "myrig/witness")
+	assertEnv(t, split.CommandEnv, "GT_RIG", "myrig")
+	assertEnv(t, split.CommandEnv, "BD_ACTOR", "myrig/witness")
+	assertEnv(t, split.CommandEnv, "GIT_AUTHOR_NAME", "myrig/witness")
+
+	// Identity vars should NOT be in SessionEnv
+	assertNotSet(t, split.SessionEnv, "GT_ROLE")
+	assertNotSet(t, split.SessionEnv, "BD_ACTOR")
+	assertNotSet(t, split.SessionEnv, "GIT_AUTHOR_NAME")
+
+	// Non-identity vars should be in SessionEnv
+	assertEnv(t, split.SessionEnv, "GT_ROOT", "/town")
+	assertEnv(t, split.SessionEnv, "NODE_OPTIONS", "")
+	assertEnv(t, split.SessionEnv, "CLAUDECODE", "")
+
+	// Non-identity vars should NOT be in CommandEnv
+	assertNotSet(t, split.CommandEnv, "GT_ROOT")
+	assertNotSet(t, split.CommandEnv, "NODE_OPTIONS")
+
+	// Verify completeness: every key in env should be in exactly one split
+	for k := range env {
+		_, inCmd := split.CommandEnv[k]
+		_, inSess := split.SessionEnv[k]
+		if !inCmd && !inSess {
+			t.Errorf("key %q in env but missing from both CommandEnv and SessionEnv", k)
+		}
+		if inCmd && inSess {
+			t.Errorf("key %q in both CommandEnv and SessionEnv", k)
+		}
+	}
+}

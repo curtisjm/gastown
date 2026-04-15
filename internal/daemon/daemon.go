@@ -1597,14 +1597,26 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 	// Check rig operational state before auto-starting
 	if operational, reason := d.isRigOperational(rigName); !operational {
 		d.logger.Printf("Skipping witness auto-start for %s: %s", rigName, reason)
-		// Kill leftover witness session if rig is not operational (docked/parked).
+		// Kill leftover witness session/window if rig is not operational (docked/parked).
 		// Without this, sessions started before the rig was docked survive until
 		// the next explicit 'gt rig dock' command. (hq-snx61)
-		name := session.WitnessSessionName(session.PrefixFor(rigName))
-		if exists, _ := d.tmux.HasSession(name); exists {
-			d.logger.Printf("Killing leftover witness %s (rig %s)", name, reason)
-			if err := d.tmux.KillSessionWithProcesses(name); err != nil {
-				d.logger.Printf("Error killing leftover witness %s: %v", name, err)
+		prefix := session.PrefixFor(rigName)
+		if agentconfig.IsWindowMode(d.config.TownRoot) {
+			rigSession := session.RigSessionName(prefix)
+			windowName := session.WindowName("witness", "")
+			if exists, _ := d.tmux.HasWindow(rigSession, windowName); exists {
+				d.logger.Printf("Killing leftover witness window %s:%s (rig %s)", rigSession, windowName, reason)
+				if err := d.tmux.KillWindow(rigSession, windowName); err != nil {
+					d.logger.Printf("Error killing leftover witness window %s:%s: %v", rigSession, windowName, err)
+				}
+			}
+		} else {
+			name := session.WitnessSessionName(prefix)
+			if exists, _ := d.tmux.HasSession(name); exists {
+				d.logger.Printf("Killing leftover witness %s (rig %s)", name, reason)
+				if err := d.tmux.KillSessionWithProcesses(name); err != nil {
+					d.logger.Printf("Error killing leftover witness %s: %v", name, err)
+				}
 			}
 		}
 		return
