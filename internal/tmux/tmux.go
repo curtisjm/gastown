@@ -3621,6 +3621,10 @@ func sessionPrefixPattern() string {
 // - Crew sessions: All crew members in the same rig
 // - Rig ops sessions: Witness + Refinery + Polecats in the same rig
 //
+// In window mode (GT_WINDOW_MODE=1 set on the rig session), C-b n/p fall
+// through to native next-window/previous-window since agents are windows
+// within a single tmux session rather than separate sessions.
+//
 // IMPORTANT: These bindings are conditional - they only run gt cycle for
 // Gas Town sessions (those matching a registered rig prefix or "hq-").
 // For non-GT sessions, the user's original binding is preserved. If no
@@ -3655,23 +3659,43 @@ func (t *Tmux) SetCycleBindings(session string) error {
 		prevFallback = "previous-window"
 	}
 
-	// C-b n → gt cycle next for Gas Town sessions, original binding otherwise
+	// C-b n → for Gas Town sessions: check GT_WINDOW_MODE and either use native
+	// next-window (window mode) or gt cycle next (session mode).
+	// For non-GT sessions: use original binding.
 	// Pass --client #{client_tty} so switch-client targets the correct client
 	// when multiple tmux clients are attached (e.g., gastown + beads rigs).
+	//
+	// The run-shell script checks GT_WINDOW_MODE in the tmux session environment.
+	// In window mode, agents are windows within a single session, so native
+	// next-window/previous-window is the correct cycling behavior.
+	nextCmd := windowModeCycleCmd("next", "next-window")
+	prevCmd := windowModeCycleCmd("prev", "previous-window")
+
 	if _, err := t.run("bind-key", "-T", "prefix", "n",
 		"if-shell", ifShell,
-		"run-shell 'gt cycle next --session #{session_name} --client #{client_tty}'",
+		nextCmd,
 		nextFallback); err != nil {
 		return err
 	}
-	// C-b p → gt cycle prev for Gas Town sessions, original binding otherwise
+	// C-b p → same logic as above, but for previous direction
 	if _, err := t.run("bind-key", "-T", "prefix", "p",
 		"if-shell", ifShell,
-		"run-shell 'gt cycle prev --session #{session_name} --client #{client_tty}'",
+		prevCmd,
 		prevFallback); err != nil {
 		return err
 	}
 	return nil
+}
+
+// windowModeCycleCmd builds the run-shell command for a cycle binding.
+// In window mode (GT_WINDOW_MODE=1), it falls through to the native tmux
+// window cycling command (next-window or previous-window).
+// In session mode, it runs gt cycle for inter-session navigation.
+func windowModeCycleCmd(direction, nativeCmd string) string {
+	return fmt.Sprintf(
+		"run-shell 'if tmux show-env -t #{session_name} GT_WINDOW_MODE 2>/dev/null | grep -q =1; then tmux %s -t #{session_name}; else gt cycle %s --session #{session_name} --client #{client_tty}; fi'",
+		nativeCmd, direction,
+	)
 }
 
 // SetFeedBinding configures C-b a to jump to the activity feed window.

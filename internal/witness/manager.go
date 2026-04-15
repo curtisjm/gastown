@@ -284,6 +284,9 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		for k, v := range split.SessionEnv {
 			_ = t.SetEnvironment(setEnvTarget, k, v)
 		}
+		// Set GT_WINDOW_MODE=1 so cycle bindings (C-b n/p) fall through to
+		// native next-window/previous-window instead of gt cycle.
+		_ = t.SetEnvironment(setEnvTarget, "GT_WINDOW_MODE", "1")
 	} else {
 		setEnvTarget = sessionID
 

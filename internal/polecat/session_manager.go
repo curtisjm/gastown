@@ -449,6 +449,9 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	envTarget := sessionID
 	if windowMode {
 		envTarget = target.Session
+		// Set GT_WINDOW_MODE=1 so cycle bindings (C-b n/p) fall through to
+		// native next-window/previous-window instead of gt cycle.
+		debugSession("SetEnvironment GT_WINDOW_MODE", m.tmux.SetEnvironment(envTarget, "GT_WINDOW_MODE", "1"))
 	}
 
 	// Set environment (non-fatal: session works without these)

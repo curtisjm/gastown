@@ -92,3 +92,77 @@ func TestSetCycleBindings_RefreshesStalePattern(t *testing.T) {
 		t.Errorf("expected binding to contain current pattern %q, got: %s", currentPattern, output)
 	}
 }
+
+// TestSetCycleBindings_WindowModeCheck verifies that SetCycleBindings installs
+// bindings that check GT_WINDOW_MODE and fall through to native window cycling.
+func TestSetCycleBindings_WindowModeCheck(t *testing.T) {
+	tm := newTestTmux(t)
+
+	session := "gt-test-winmode-" + t.Name()
+	_ = tm.KillSession(session)
+	defer func() { _ = tm.KillSession(session) }()
+
+	if err := tm.NewSessionWithCommand(session, "", "sleep 30"); err != nil {
+		t.Fatalf("session creation: %v", err)
+	}
+
+	// Call SetCycleBindings to install fresh bindings
+	if err := tm.SetCycleBindings(session); err != nil {
+		t.Fatalf("SetCycleBindings: %v", err)
+	}
+
+	// Verify C-b n binding contains the GT_WINDOW_MODE check
+	nOutput, err := tm.run("list-keys", "-T", "prefix", "n")
+	if err != nil {
+		t.Fatalf("listing n key: %v", err)
+	}
+	if !strings.Contains(nOutput, "GT_WINDOW_MODE") {
+		t.Errorf("C-b n binding missing GT_WINDOW_MODE check, got: %s", nOutput)
+	}
+	if !strings.Contains(nOutput, "next-window") {
+		t.Errorf("C-b n binding missing next-window fallback for window mode, got: %s", nOutput)
+	}
+	if !strings.Contains(nOutput, "gt cycle next") {
+		t.Errorf("C-b n binding missing gt cycle next for session mode, got: %s", nOutput)
+	}
+
+	// Verify C-b p binding contains the GT_WINDOW_MODE check
+	pOutput, err := tm.run("list-keys", "-T", "prefix", "p")
+	if err != nil {
+		t.Fatalf("listing p key: %v", err)
+	}
+	if !strings.Contains(pOutput, "GT_WINDOW_MODE") {
+		t.Errorf("C-b p binding missing GT_WINDOW_MODE check, got: %s", pOutput)
+	}
+	if !strings.Contains(pOutput, "previous-window") {
+		t.Errorf("C-b p binding missing previous-window fallback for window mode, got: %s", pOutput)
+	}
+	if !strings.Contains(pOutput, "gt cycle prev") {
+		t.Errorf("C-b p binding missing gt cycle prev for session mode, got: %s", pOutput)
+	}
+}
+
+// TestWindowModeCycleCmd verifies the generated shell command structure.
+func TestWindowModeCycleCmd(t *testing.T) {
+	cmd := windowModeCycleCmd("next", "next-window")
+	if !strings.Contains(cmd, "GT_WINDOW_MODE") {
+		t.Error("command missing GT_WINDOW_MODE check")
+	}
+	if !strings.Contains(cmd, "tmux next-window") {
+		t.Error("command missing tmux next-window for window mode")
+	}
+	if !strings.Contains(cmd, "gt cycle next") {
+		t.Error("command missing gt cycle next for session mode")
+	}
+	if !strings.HasPrefix(cmd, "run-shell '") {
+		t.Error("command should start with run-shell")
+	}
+
+	cmd = windowModeCycleCmd("prev", "previous-window")
+	if !strings.Contains(cmd, "tmux previous-window") {
+		t.Error("command missing tmux previous-window for window mode")
+	}
+	if !strings.Contains(cmd, "gt cycle prev") {
+		t.Error("command missing gt cycle prev for session mode")
+	}
+}
