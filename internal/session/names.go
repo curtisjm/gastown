@@ -66,3 +66,21 @@ func BootSessionName() string {
 func DogSessionName(name string) string {
 	return fmt.Sprintf("%sdog-%s", HQPrefix, name)
 }
+
+// RigSessionName returns the tmux session name for a rig in window mode.
+// All rig agents share this single session, each in a named window.
+// rigPrefix is the rig's beads prefix (e.g., "gt" for gastown).
+// Pattern: <prefix>-rig (e.g., "gt-rig").
+func RigSessionName(rigPrefix string) string {
+	return fmt.Sprintf("%s-rig", rigPrefix)
+}
+
+// WindowName returns the tmux window name for an agent in window mode.
+// For named agents (polecats, crew): returns the agent name (e.g., "Toast", "jack").
+// For singleton agents (witness, refinery): returns the role (e.g., "witness").
+func WindowName(role, name string) string {
+	if name != "" {
+		return name
+	}
+	return role
+}

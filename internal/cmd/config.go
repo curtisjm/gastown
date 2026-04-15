@@ -621,6 +621,9 @@ Supported keys:
                               completion (true/false, default: false)
   cli_theme                   CLI color scheme ("dark", "light", "auto")
   default_agent               Default agent preset name
+  window_mode                 Tmux topology: true = rig agents share one session
+                              with named windows; false = one session per agent
+                              (true/false, default: false)
   dolt.port                   Dolt SQL server port (default: 3307). Set this when
                               another Gas Town instance is using the same port.
                               Writes GT_DOLT_PORT to mayor/daemon.json env section.
@@ -647,6 +650,7 @@ Examples:
   gt config set convoy.notify_on_complete true
   gt config set cli_theme dark
   gt config set default_agent claude
+  gt config set window_mode true
   gt config set dolt.port 3308
   gt config set scheduler.max_polecats 5
   gt config set maintenance.window 03:00
@@ -668,6 +672,7 @@ Supported keys:
                               completion (true/false, default: false)
   cli_theme                   CLI color scheme
   default_agent               Default agent preset name
+  window_mode                 Tmux topology (true/false, default: false)
   scheduler.max_polecats      Dispatch mode (-1 = direct, N > 0 = deferred)
   scheduler.batch_size        Beads per heartbeat
   scheduler.spawn_delay       Delay between spawns
@@ -690,6 +695,7 @@ Supported keys:
 Examples:
   gt config get convoy.notify_on_complete
   gt config get cli_theme
+  gt config get window_mode
   gt config get maintenance.window
   gt config get lifecycle.reaper.delete_age`,
 	Args: cobra.ExactArgs(1),
@@ -732,6 +738,13 @@ func runConfigSet(cmd *cobra.Command, args []string) error {
 
 	case "default_agent":
 		townSettings.DefaultAgent = value
+
+	case "window_mode":
+		b, err := parseBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %w (expected true/false)", key, err)
+		}
+		townSettings.WindowMode = b
 
 	case "scheduler.max_polecats":
 		n, err := strconv.Atoi(value)
@@ -794,7 +807,7 @@ func runConfigSet(cmd *cobra.Command, args []string) error {
 		if strings.HasPrefix(key, "lifecycle.") {
 			return setLifecycleConfig(townRoot, key, value)
 		}
-		return fmt.Errorf("unknown config key: %q\n\nSupported keys:\n  convoy.notify_on_complete\n  cli_theme\n  default_agent\n  dolt.port\n  scheduler.max_polecats\n  scheduler.batch_size\n  scheduler.spawn_delay\n  maintenance.window\n  maintenance.interval\n  maintenance.threshold\n  lifecycle.reaper.*\n  lifecycle.compactor.*\n  lifecycle.doctor.*\n  lifecycle.backup.*", key)
+		return fmt.Errorf("unknown config key: %q\n\nSupported keys:\n  convoy.notify_on_complete\n  cli_theme\n  default_agent\n  window_mode\n  dolt.port\n  scheduler.max_polecats\n  scheduler.batch_size\n  scheduler.spawn_delay\n  maintenance.window\n  maintenance.interval\n  maintenance.threshold\n  lifecycle.reaper.*\n  lifecycle.compactor.*\n  lifecycle.doctor.*\n  lifecycle.backup.*", key)
 	}
 
 	if err := config.SaveTownSettings(settingsPath, townSettings); err != nil {
@@ -840,6 +853,13 @@ func runConfigGet(cmd *cobra.Command, args []string) error {
 			value = "claude"
 		}
 
+	case "window_mode":
+		if townSettings.WindowMode {
+			value = "true"
+		} else {
+			value = "false"
+		}
+
 	case "scheduler.max_polecats":
 		scfg := townSettings.Scheduler
 		if scfg == nil {
@@ -879,7 +899,7 @@ func runConfigGet(cmd *cobra.Command, args []string) error {
 		if strings.HasPrefix(key, "lifecycle.") {
 			return getLifecycleConfig(townRoot, key)
 		}
-		return fmt.Errorf("unknown config key: %q\n\nSupported keys:\n  convoy.notify_on_complete\n  cli_theme\n  default_agent\n  dolt.port\n  scheduler.max_polecats\n  scheduler.batch_size\n  scheduler.spawn_delay\n  maintenance.window\n  maintenance.interval\n  maintenance.threshold\n  lifecycle.reaper.*\n  lifecycle.compactor.*\n  lifecycle.doctor.*\n  lifecycle.backup.*", key)
+		return fmt.Errorf("unknown config key: %q\n\nSupported keys:\n  convoy.notify_on_complete\n  cli_theme\n  default_agent\n  window_mode\n  dolt.port\n  scheduler.max_polecats\n  scheduler.batch_size\n  scheduler.spawn_delay\n  maintenance.window\n  maintenance.interval\n  maintenance.threshold\n  lifecycle.reaper.*\n  lifecycle.compactor.*\n  lifecycle.doctor.*\n  lifecycle.backup.*", key)
 	}
 
 	fmt.Println(value)

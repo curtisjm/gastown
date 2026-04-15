@@ -120,6 +120,13 @@ type TownSettings struct {
 	// "main_branch_test", "handler").
 	// Example: ["doctor_dog", "compactor_dog"]
 	DisabledPatrols []string `json:"disabled_patrols,omitempty"`
+
+	// WindowMode controls tmux topology for rig agents.
+	// When false (default), each agent gets its own tmux session.
+	// When true, all agents in a rig share one tmux session with named windows.
+	// Town-level agents (mayor, deacon, boot, dogs) always use sessions.
+	// Set via: gt config set window_mode true
+	WindowMode bool `json:"window_mode,omitempty"`
 }
 
 // NewTownSettings creates a new TownSettings with defaults.

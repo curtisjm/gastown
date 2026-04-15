@@ -98,5 +98,8 @@
         "min_aggregate_count": 3
     },
 
-    "disabled_patrols": ["doctor_dog", "compactor_dog"]
+    "disabled_patrols": ["doctor_dog", "compactor_dog"],
+
+    "_comment_window_mode": "When true, rig agents share one tmux session with named windows instead of separate sessions.",
+    "window_mode": false
 }

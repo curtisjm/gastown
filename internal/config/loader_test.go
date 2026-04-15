@@ -2813,6 +2813,42 @@ func TestSaveTownSettings(t *testing.T) {
 	})
 }
 
+func TestIsWindowMode(t *testing.T) {
+	t.Parallel()
+
+	t.Run("false when settings file missing", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		if IsWindowMode(tmpDir) {
+			t.Error("IsWindowMode() = true for missing settings, want false")
+		}
+	})
+
+	t.Run("false when window_mode not set", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		settingsPath := TownSettingsPath(tmpDir)
+		settings := NewTownSettings()
+		if err := SaveTownSettings(settingsPath, settings); err != nil {
+			t.Fatalf("SaveTownSettings: %v", err)
+		}
+		if IsWindowMode(tmpDir) {
+			t.Error("IsWindowMode() = true for default settings, want false")
+		}
+	})
+
+	t.Run("true when window_mode enabled", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		settingsPath := TownSettingsPath(tmpDir)
+		settings := NewTownSettings()
+		settings.WindowMode = true
+		if err := SaveTownSettings(settingsPath, settings); err != nil {
+			t.Fatalf("SaveTownSettings: %v", err)
+		}
+		if !IsWindowMode(tmpDir) {
+			t.Error("IsWindowMode() = false for enabled settings, want true")
+		}
+	})
+}
+
 func TestGetDefaultFormula(t *testing.T) {
 	t.Parallel()
 	t.Run("returns empty string for nonexistent rig", func(t *testing.T) {

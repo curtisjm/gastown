@@ -1096,6 +1096,16 @@ func SaveTownSettings(path string, settings *TownSettings) error {
 	return nil
 }
 
+// IsWindowMode returns true if window mode is enabled in town settings.
+// This is the single query point for all code that needs to check window mode.
+func IsWindowMode(townRoot string) bool {
+	settings, err := LoadOrCreateTownSettings(TownSettingsPath(townRoot))
+	if err != nil {
+		return false
+	}
+	return settings.WindowMode
+}
+
 // ResolveAgentConfig resolves the agent configuration for a rig.
 // It looks up the agent by name in town settings (custom agents) and built-in presets.
 //

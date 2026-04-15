@@ -110,6 +110,47 @@ func TestPolecatSessionName(t *testing.T) {
 	}
 }
 
+func TestRigSessionName(t *testing.T) {
+	tests := []struct {
+		rigPrefix string
+		want      string
+	}{
+		{"gt", "gt-rig"},
+		{"bd", "bd-rig"},
+		{"hop", "hop-rig"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.rigPrefix, func(t *testing.T) {
+			got := RigSessionName(tt.rigPrefix)
+			if got != tt.want {
+				t.Errorf("RigSessionName(%q) = %q, want %q", tt.rigPrefix, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWindowName(t *testing.T) {
+	tests := []struct {
+		role string
+		name string
+		want string
+	}{
+		{"witness", "", "witness"},
+		{"refinery", "", "refinery"},
+		{"polecat", "Toast", "Toast"},
+		{"crew", "jack", "jack"},
+		{"polecat", "Furiosa", "Furiosa"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.role+"/"+tt.name, func(t *testing.T) {
+			got := WindowName(tt.role, tt.name)
+			if got != tt.want {
+				t.Errorf("WindowName(%q, %q) = %q, want %q", tt.role, tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDefaultPrefix(t *testing.T) {
 	want := "gt"
 	if DefaultPrefix != want {
