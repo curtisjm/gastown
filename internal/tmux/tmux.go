@@ -43,6 +43,7 @@ var (
 	ErrNoServer           = errors.New("no tmux server running")
 	ErrSessionExists      = errors.New("session already exists")
 	ErrSessionNotFound    = errors.New("session not found")
+	ErrWindowNotFound     = errors.New("window not found")
 	ErrSessionRunning     = errors.New("session already running with healthy agent")
 	ErrInvalidSessionName = errors.New("invalid session name")
 	ErrIdleTimeout        = errors.New("agent not idle before timeout")
@@ -259,6 +260,10 @@ func (t *Tmux) wrapError(err error, stderr string, args []string) error {
 	if strings.Contains(stderr, "session not found") ||
 		strings.Contains(stderr, "can't find session") {
 		return ErrSessionNotFound
+	}
+	if strings.Contains(stderr, "window not found") ||
+		strings.Contains(stderr, "can't find window") {
+		return ErrWindowNotFound
 	}
 
 	if stderr != "" {
@@ -2341,6 +2346,109 @@ func (t *Tmux) AttachSession(session string) error {
 // SelectWindow selects a window by index.
 func (t *Tmux) SelectWindow(session string, index int) error {
 	_, err := t.run("select-window", "-t", fmt.Sprintf("%s:%d", session, index))
+	return err
+}
+
+// HasWindow checks whether a named window exists in the given session.
+func (t *Tmux) HasWindow(session, window string) (bool, error) {
+	out, err := t.run("list-windows", "-t", session, "-F", "#{window_name}")
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == window {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// NewWindowWithCommand creates a new named window in an existing session and
+// runs a command in it. Uses the same two-step pattern as NewSessionWithCommand:
+// create the window with a default shell, then respawn-pane to replace the
+// shell with the actual command. This avoids races between window creation
+// and command execution.
+func (t *Tmux) NewWindowWithCommand(session, window, workDir, command string) error {
+	args := []string{"new-window", "-t", session, "-n", window, "-d"}
+	if workDir != "" {
+		args = append(args, "-c", workDir)
+	}
+	if _, err := t.run(args...); err != nil {
+		return err
+	}
+
+	// Replace the default shell with the actual command, matching the
+	// NewSessionWithCommand respawn-pane pattern.
+	target := fmt.Sprintf("%s:%s", session, window)
+	if runtime.GOOS == "windows" {
+		if _, err := t.run("send-keys", "-t", target, command, "Enter"); err != nil {
+			// Clean up the window on failure.
+			_, _ = t.run("kill-window", "-t", target)
+			return fmt.Errorf("failed to send command in window %q: %w", target, err)
+		}
+	} else {
+		respawnArgs := []string{"respawn-pane", "-k", "-t", target}
+		if workDir != "" {
+			respawnArgs = append(respawnArgs, "-c", workDir)
+		}
+		respawnArgs = append(respawnArgs, command)
+		if _, err := t.run(respawnArgs...); err != nil {
+			_, _ = t.run("kill-window", "-t", target)
+			return fmt.Errorf("failed to start command in window %q: %w", target, err)
+		}
+	}
+	return nil
+}
+
+// KillWindow kills a named window in the given session. If the window is the
+// last one in the session, the session itself is destroyed (destroy-on-last
+// semantics per design decision D1).
+func (t *Tmux) KillWindow(session, window string) error {
+	target := fmt.Sprintf("%s:%s", session, window)
+	_, err := t.run("kill-window", "-t", target)
+	if errors.Is(err, ErrWindowNotFound) || errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+		return nil
+	}
+	return err
+}
+
+// ListWindows returns the names of all windows in the given session.
+func (t *Tmux) ListWindows(session string) ([]string, error) {
+	out, err := t.run("list-windows", "-t", session, "-F", "#{window_name}")
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	var windows []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			windows = append(windows, line)
+		}
+	}
+	return windows, nil
+}
+
+// WindowCount returns the number of windows in the given session.
+func (t *Tmux) WindowCount(session string) (int, error) {
+	windows, err := t.ListWindows(session)
+	if err != nil {
+		return 0, err
+	}
+	return len(windows), nil
+}
+
+// RenameWindow renames a window identified by its index within a session.
+func (t *Tmux) RenameWindow(session string, index int, name string) error {
+	_, err := t.run("rename-window", "-t", fmt.Sprintf("%s:%d", session, index), name)
 	return err
 }
 
