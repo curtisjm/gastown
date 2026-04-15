@@ -425,11 +425,15 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 	// Create session/window with command directly to avoid send-keys race condition.
 	// See: https://github.com/anthropics/gastown/issues/280
+	var createdRigSession bool
 	if windowMode {
 		// Window mode: ensure rig session exists, then create a named window.
+		// Track whether we created the session so we can apply one-time config.
+		rigExists, _ := m.tmux.HasSession(target.Session)
 		if err := m.ensureRigSession(target.Session, workDir); err != nil {
 			return fmt.Errorf("ensuring rig session: %w", err)
 		}
+		createdRigSession = !rigExists
 		if err := m.tmux.NewWindowWithCommand(target.Session, target.Window, workDir, command); err != nil {
 			return fmt.Errorf("creating window: %w", err)
 		}
@@ -520,9 +524,18 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 
 	// Apply theme and session config (non-fatal).
-	// In window mode, session-level theming is configured once for the rig session
-	// (Phase 5). Per-window theming is not yet implemented.
-	if !windowMode {
+	if windowMode {
+		// Window mode: configure rig session once (first agent), then per-window theme.
+		if createdRigSession {
+			rigTheme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "polecat", "")
+			debugSession("ConfigureWindowModeSession", m.tmux.ConfigureWindowModeSession(target.Session, rigTheme, m.rig.Name))
+		}
+		// Per-window background color based on the polecat's theme.
+		theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "polecat", polecat)
+		if theme != nil && theme.Window != nil {
+			debugSession("ApplyWindowTheme", m.tmux.ApplyWindowTheme(target.Session, target.Window, theme.Window))
+		}
+	} else {
 		theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "polecat", polecat)
 		debugSession("ConfigureGasTownSession", m.tmux.ConfigureGasTownSession(sessionID, theme, m.rig.Name, polecat, "polecat"))
 	}

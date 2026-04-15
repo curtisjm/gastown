@@ -255,12 +255,14 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	// are per-session.
 	var setEnvTarget string
 
+	var createdRigSession bool
 	if windowMode {
 		target := m.Target()
 		setEnvTarget = target.Session
 
 		// Ensure rig session exists (create-on-first-agent per D1).
 		if exists, _ := t.HasSession(target.Session); !exists {
+			createdRigSession = true
 			// Create rig session with witness as the initial window.
 			if err := t.NewSessionWithCommand(target.Session, witnessDir, command); err != nil {
 				return fmt.Errorf("creating rig session: %w", err)
@@ -320,9 +322,21 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		}
 	}
 
-	// Apply Gas Town theming (non-fatal: theming failure doesn't affect operation)
+	// Apply Gas Town theming (non-fatal: theming failure doesn't affect operation).
 	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "witness", "")
-	_ = t.ConfigureGasTownSession(setEnvTarget, theme, m.rig.Name, "witness", "witness")
+	if windowMode {
+		// Window mode: configure rig session once (first agent), then per-window theme.
+		if createdRigSession {
+			_ = t.ConfigureWindowModeSession(setEnvTarget, theme, m.rig.Name)
+		}
+		// Per-window background color for the witness window.
+		target := m.Target()
+		if theme != nil && theme.Window != nil {
+			_ = t.ApplyWindowTheme(target.Session, target.Window, theme.Window)
+		}
+	} else {
+		_ = t.ConfigureGasTownSession(setEnvTarget, theme, m.rig.Name, "witness", "witness")
+	}
 
 	// Wait for Claude to start - fatal if Claude fails to launch
 	if err := t.WaitForCommand(tmuxTarget, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {

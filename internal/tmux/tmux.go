@@ -3199,6 +3199,86 @@ func (t *Tmux) ApplyWindowStyle(session string, ws *WindowStyle) error {
 	return err
 }
 
+// ApplyWindowTheme sets per-window background color using session:window targeting.
+// This is the window-mode counterpart to ApplyWindowStyle — it targets a specific
+// window within a shared rig session instead of the entire session.
+// If ws is nil, resets to terminal defaults.
+func (t *Tmux) ApplyWindowTheme(session, window string, ws *WindowStyle) error {
+	target := fmt.Sprintf("%s:%s", session, window)
+	style := "bg=default,fg=default"
+	if ws != nil {
+		style = ws.Style()
+	}
+	_, err := t.run("set-option", "-w", "-t", target, "window-style", style)
+	return err
+}
+
+// ConfigureWindowModeSession configures a rig session for window mode.
+// Called once when the rig session is created. Sets up:
+//   - Session-level status bar (rig name + icon in status-left)
+//   - Window tab format showing per-window agent icons/names
+//   - Dynamic status right, key bindings, and mouse mode
+//
+// theme controls the session-level status bar colors. A nil theme means
+// theming is disabled (status bar uses terminal defaults).
+func (t *Tmux) ConfigureWindowModeSession(session string, theme *Theme, rig string) error {
+	// Apply session-level theme (status bar colors).
+	if theme != nil {
+		if err := t.ApplyTheme(session, *theme); err != nil {
+			return fmt.Errorf("applying theme: %w", err)
+		}
+	} else {
+		if err := t.ClearTheme(session); err != nil {
+			return fmt.Errorf("clearing theme: %w", err)
+		}
+	}
+
+	// Status-left: rig name. Use the rig prefix (e.g., "gt-rig") as identity.
+	left := fmt.Sprintf("⚙ %s ", rig)
+	if _, err := t.run("set-option", "-t", session, "status-left-length", "25"); err != nil {
+		return fmt.Errorf("setting status-left-length: %w", err)
+	}
+	if _, err := t.run("set-option", "-t", session, "status-left", left); err != nil {
+		return fmt.Errorf("setting status-left: %w", err)
+	}
+
+	// Window tab format: show role icon + agent name for each window.
+	// #{window_name} is the agent name (e.g., "Toast", "witness", "refinery").
+	// Current window is highlighted with brackets.
+	windowFormat := " #{window_name} "
+	windowCurrentFormat := " [#{window_name}] "
+	if _, err := t.run("set-option", "-t", session, "window-status-format", windowFormat); err != nil {
+		return fmt.Errorf("setting window-status-format: %w", err)
+	}
+	if _, err := t.run("set-option", "-t", session, "window-status-current-format", windowCurrentFormat); err != nil {
+		return fmt.Errorf("setting window-status-current-format: %w", err)
+	}
+
+	// Dynamic status right, key bindings, mouse mode.
+	if err := t.SetDynamicStatus(session); err != nil {
+		return fmt.Errorf("setting dynamic status: %w", err)
+	}
+	if err := t.SetMailClickBinding(session); err != nil {
+		return fmt.Errorf("setting mail click binding: %w", err)
+	}
+	if err := t.SetFeedBinding(session); err != nil {
+		return fmt.Errorf("setting feed binding: %w", err)
+	}
+	if err := t.SetAgentsBinding(session); err != nil {
+		return fmt.Errorf("setting agents binding: %w", err)
+	}
+	if err := t.SetRigMenuBinding(session); err != nil {
+		return fmt.Errorf("setting rig menu binding: %w", err)
+	}
+	if err := t.SetCycleBindings(session); err != nil {
+		return fmt.Errorf("setting cycle bindings: %w", err)
+	}
+	if err := t.EnableMouseMode(session); err != nil {
+		return fmt.Errorf("enabling mouse mode: %w", err)
+	}
+	return nil
+}
+
 // roleIcons maps role names to display icons for the status bar.
 // Uses centralized emojis from constants package.
 // Includes legacy keys ("coordinator", "health-check") for backwards compatibility.
