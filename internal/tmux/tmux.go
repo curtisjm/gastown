@@ -4132,3 +4132,79 @@ func buildAutoRespawnHookCmd(tmuxCmd, session string) string {
 		`run-shell -b "sleep 3 && %s list-panes -t '%s' -F '##{pane_dead}' 2>/dev/null | grep -q 1 && %s respawn-pane -k -t '%s' && %s set-option -t '%s' remain-on-exit on || true"`,
 		tmuxCmd, session, tmuxCmd, session, tmuxCmd, session)
 }
+
+// SetPaneDiedHookWindow sets a pane-died hook on a specific window (not session)
+// to detect crashes. Uses the -w flag for window-scoped hooks, so each agent
+// window in a shared rig session gets its own independent crash detection.
+func (t *Tmux) SetPaneDiedHookWindow(session, window, agentID string) error {
+	target := fmt.Sprintf("%s:%s", session, window)
+	agentID = strings.ReplaceAll(agentID, "'", "'\\''")
+	safeTarget := strings.ReplaceAll(target, "'", "'\\''")
+
+	hookCmd := fmt.Sprintf(`run-shell "gt log crash --agent '%s' --session '%s' --exit-code #{pane_dead_status}"`,
+		agentID, safeTarget)
+
+	_, err := t.run("set-hook", "-w", "-t", target, "pane-died", hookCmd)
+	return err
+}
+
+// SetAutoRespawnHookWindow configures a specific window to automatically respawn
+// when the pane dies. Window-scoped variant of SetAutoRespawnHook using -w flag.
+// Each window in a shared rig session gets independent auto-respawn behavior.
+func (t *Tmux) SetAutoRespawnHookWindow(session, window string) error {
+	target := fmt.Sprintf("%s:%s", session, window)
+
+	if err := t.SetRemainOnExit(target, true); err != nil {
+		return fmt.Errorf("setting remain-on-exit for window %s: %w", target, err)
+	}
+
+	safeTarget := strings.ReplaceAll(target, "'", "'\\''")
+
+	tmuxCmd := "tmux"
+	if t.socketName != "" {
+		tmuxCmd = fmt.Sprintf("tmux -L %s", t.socketName)
+	}
+
+	hookCmd := buildAutoRespawnHookCmd(tmuxCmd, safeTarget)
+
+	_, err := t.run("set-hook", "-w", "-t", target, "pane-died", hookCmd)
+	if err != nil {
+		return fmt.Errorf("setting window pane-died hook: %w", err)
+	}
+
+	return nil
+}
+
+// KillWindowWithProcesses kills a window's pane processes then removes the window.
+// Window-mode equivalent of KillSessionWithProcesses: disarms auto-respawn hooks,
+// kills descendant processes, then kills the window. If this is the last window
+// in the session, KillWindow destroys the session (D1 semantics).
+func (t *Tmux) KillWindowWithProcesses(session, window string) error {
+	target := fmt.Sprintf("%s:%s", session, window)
+
+	_ = t.SetRemainOnExit(target, false)
+	_, _ = t.run("set-hook", "-w", "-t", target, "-u", "pane-died")
+
+	pid, err := t.GetPanePID(target)
+	if err != nil {
+		return t.KillWindow(session, window)
+	}
+
+	if pid != "" {
+		descendants := getAllDescendants(pid)
+
+		for _, dpid := range descendants {
+			_ = exec.Command("kill", "-TERM", dpid).Run() //nolint:gosec // G204: pid from tmux
+		}
+		time.Sleep(processKillGracePeriod)
+		for _, dpid := range descendants {
+			_ = exec.Command("kill", "-KILL", dpid).Run() //nolint:gosec // G204: pid from tmux
+		}
+
+		_ = exec.Command("kill", "-TERM", pid).Run() //nolint:gosec // G204: pid from tmux
+		time.Sleep(processKillGracePeriod)
+		_ = exec.Command("kill", "-KILL", pid).Run() //nolint:gosec // G204: pid from tmux
+	}
+
+	return t.KillWindow(session, window)
+}

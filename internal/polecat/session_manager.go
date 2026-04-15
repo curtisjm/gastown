@@ -541,9 +541,12 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 
 	// Set pane-died hook for crash detection (non-fatal).
-	// In window mode, per-window hooks (set-hook -w) come with Phase 7.
 	agentID := fmt.Sprintf("%s/%s", m.rig.Name, polecat)
-	if !windowMode {
+	if windowMode {
+		// Phase 7: per-window hooks use -w flag so each window in the shared
+		// rig session gets independent crash detection.
+		debugSession("SetPaneDiedHookWindow", m.tmux.SetPaneDiedHookWindow(target.Session, target.Window, agentID))
+	} else {
 		debugSession("SetPaneDiedHook", m.tmux.SetPaneDiedHook(sessionID, agentID))
 	}
 

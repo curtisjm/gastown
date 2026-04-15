@@ -1669,14 +1669,26 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	// Check rig operational state before auto-starting
 	if operational, reason := d.isRigOperational(rigName); !operational {
 		d.logger.Printf("Skipping refinery auto-start for %s: %s", rigName, reason)
-		// Kill leftover refinery session if rig is not operational (docked/parked).
+		// Kill leftover refinery session/window if rig is not operational (docked/parked).
 		// Without this, sessions started before the rig was docked survive until
 		// the next explicit 'gt rig dock' command. (hq-snx61)
-		name := session.RefinerySessionName(session.PrefixFor(rigName))
-		if exists, _ := d.tmux.HasSession(name); exists {
-			d.logger.Printf("Killing leftover refinery %s (rig %s)", name, reason)
-			if err := d.tmux.KillSessionWithProcesses(name); err != nil {
-				d.logger.Printf("Error killing leftover refinery %s: %v", name, err)
+		prefix := session.PrefixFor(rigName)
+		if agentconfig.IsWindowMode(d.config.TownRoot) {
+			rigSession := session.RigSessionName(prefix)
+			windowName := session.WindowName("refinery", "")
+			if exists, _ := d.tmux.HasWindow(rigSession, windowName); exists {
+				d.logger.Printf("Killing leftover refinery window %s:%s (rig %s)", rigSession, windowName, reason)
+				if err := d.tmux.KillWindow(rigSession, windowName); err != nil {
+					d.logger.Printf("Error killing leftover refinery window %s:%s: %v", rigSession, windowName, err)
+				}
+			}
+		} else {
+			name := session.RefinerySessionName(prefix)
+			if exists, _ := d.tmux.HasSession(name); exists {
+				d.logger.Printf("Killing leftover refinery %s (rig %s)", name, reason)
+				if err := d.tmux.KillSessionWithProcesses(name); err != nil {
+					d.logger.Printf("Error killing leftover refinery %s: %v", name, err)
+				}
 			}
 		}
 		return
@@ -1832,6 +1844,12 @@ func (d *Daemon) killRefinerySessions() {
 // sessions that correspond to rigs with their own prefix are stale duplicates.
 // Fix for: hq-ouz, hq-eqf, hq-3i4.
 func (d *Daemon) killDefaultPrefixGhosts() {
+	// In window mode, agents are windows in rig sessions — individual session
+	// names like "gt-witness" don't exist, so ghost session checks are irrelevant.
+	if agentconfig.IsWindowMode(d.config.TownRoot) {
+		return
+	}
+
 	reg := session.DefaultRegistry()
 	allRigs := reg.AllRigs() // rigName → shortPrefix
 	if len(allRigs) == 0 {
@@ -2447,27 +2465,39 @@ func listPolecatWorktrees(polecatsDir string) ([]string, error) {
 	return polecats, nil
 }
 
-// checkPolecatHealth checks a single polecat's session health.
-// If the polecat has work-on-hook but the tmux session is dead, it's restarted.
+// checkPolecatHealth checks a single polecat's session/window health.
+// If the polecat has work-on-hook but the tmux session/window is dead, it's restarted.
 func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
-	// Build the expected tmux session name
-	sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
+	prefix := session.PrefixFor(rigName)
+	windowMode := agentconfig.IsWindowMode(d.config.TownRoot)
 
-	// Check if tmux session exists
-	sessionAlive, err := d.tmux.HasSession(sessionName)
+	// Check if the polecat's tmux session/window exists
+	var sessionAlive bool
+	var err error
+	var targetDesc string // for log messages
+
+	if windowMode {
+		rigSession := session.RigSessionName(prefix)
+		windowName := session.WindowName("polecat", polecatName)
+		targetDesc = fmt.Sprintf("%s:%s", rigSession, windowName)
+		sessionAlive, err = d.tmux.HasWindow(rigSession, windowName)
+	} else {
+		targetDesc = session.PolecatSessionName(prefix, polecatName)
+		sessionAlive, err = d.tmux.HasSession(targetDesc)
+	}
+
 	if err != nil {
-		d.logger.Printf("Error checking session %s: %v", sessionName, err)
+		d.logger.Printf("Error checking %s: %v", targetDesc, err)
 		return
 	}
 
 	if sessionAlive {
-		// Session is alive - nothing to do
 		return
 	}
 
-	// Session is dead. Check if the polecat has work-on-hook.
-	prefix := beads.GetPrefixForRig(d.config.TownRoot, rigName)
-	agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
+	// Session/window is dead. Check if the polecat has work-on-hook.
+	beadsPrefix := beads.GetPrefixForRig(d.config.TownRoot, rigName)
+	agentBeadID := beads.PolecatBeadIDWithPrefix(beadsPrefix, rigName, polecatName)
 	info, err := d.getAgentBeadInfo(agentBeadID)
 	if err != nil {
 		// Agent bead doesn't exist or error - polecat might not be registered
@@ -2535,24 +2565,31 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 		}
 	}
 
-	// TOCTOU guard: re-verify session is still dead before restarting.
+	// TOCTOU guard: re-verify session/window is still dead before restarting.
 	// Between the initial check and now, the session may have been restarted
 	// by another heartbeat cycle, witness, or the polecat itself.
-	sessionRevived, err := d.tmux.HasSession(sessionName)
+	var sessionRevived bool
+	if windowMode {
+		rigSession := session.RigSessionName(prefix)
+		windowName := session.WindowName("polecat", polecatName)
+		sessionRevived, err = d.tmux.HasWindow(rigSession, windowName)
+	} else {
+		sessionRevived, err = d.tmux.HasSession(targetDesc)
+	}
 	if err == nil && sessionRevived {
-		return // Session came back - no restart needed
+		return // Session/window came back - no restart needed
 	}
 
-	// Polecat has work but session is dead - this is a crash!
-	d.logger.Printf("CRASH DETECTED: polecat %s/%s has hook_bead=%s but session %s is dead",
-		rigName, polecatName, info.HookBead, sessionName)
+	// Polecat has work but session/window is dead - this is a crash!
+	d.logger.Printf("CRASH DETECTED: polecat %s/%s has hook_bead=%s but %s is dead",
+		rigName, polecatName, info.HookBead, targetDesc)
 
 	// Track this death for mass death detection
-	d.recordSessionDeath(sessionName)
+	d.recordSessionDeath(targetDesc)
 
 	// Emit session_death event for audit trail / feed visibility
-	_ = events.LogFeed(events.TypeSessionDeath, sessionName,
-		events.SessionDeathPayload(sessionName, rigName+"/polecats/"+polecatName, "crash detected by daemon health check", "daemon"))
+	_ = events.LogFeed(events.TypeSessionDeath, targetDesc,
+		events.SessionDeathPayload(targetDesc, rigName+"/polecats/"+polecatName, "crash detected by daemon health check", "daemon"))
 
 	// Notify witness — stuck-agent-dog plugin handles context-aware restart
 	d.notifyWitnessOfCrashedPolecat(rigName, polecatName, info.HookBead)
@@ -2712,16 +2749,34 @@ func (d *Daemon) reapRigIdlePolecats(rigName string, timeout time.Duration) {
 //     gt done — persistentPreRun resets heartbeat to "working" on every gt sub-command,
 //     so after gt done finishes the heartbeat shows "working" with a stale timestamp.
 func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Duration) {
-	sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
+	prefix := session.PrefixFor(rigName)
+	windowMode := agentconfig.IsWindowMode(d.config.TownRoot)
 
-	// Only check sessions that are actually alive
-	alive, err := d.tmux.HasSession(sessionName)
+	// Build the tmux target name (session name or session:window)
+	var targetName string
+	var alive bool
+	var err error
+
+	if windowMode {
+		rigSession := session.RigSessionName(prefix)
+		windowName := session.WindowName("polecat", polecatName)
+		targetName = fmt.Sprintf("%s:%s", rigSession, windowName)
+		alive, err = d.tmux.HasWindow(rigSession, windowName)
+	} else {
+		targetName = session.PolecatSessionName(prefix, polecatName)
+		alive, err = d.tmux.HasSession(targetName)
+	}
 	if err != nil || !alive {
 		return
 	}
 
-	// Read heartbeat to check state and idle duration
-	hb := polecat.ReadSessionHeartbeat(d.config.TownRoot, sessionName)
+	// Read heartbeat to check state and idle duration.
+	// Heartbeat files use the session name (not session:window) as the key.
+	heartbeatKey := targetName
+	if windowMode {
+		heartbeatKey = session.PolecatSessionName(prefix, polecatName)
+	}
+	hb := polecat.ReadSessionHeartbeat(d.config.TownRoot, heartbeatKey)
 	if hb == nil {
 		return // No heartbeat file — can't determine state
 	}
@@ -2735,7 +2790,7 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 
 	// Explicitly idle or exiting — safe to reap
 	if state == polecat.HeartbeatIdle || state == polecat.HeartbeatExiting {
-		d.killIdlePolecat(rigName, polecatName, sessionName, staleDuration, timeout, string(state))
+		d.killIdlePolecat(rigName, polecatName, targetName, staleDuration, timeout, string(state))
 		return
 	}
 
@@ -2744,16 +2799,16 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 	// and is sitting idle (heartbeat wasn't updated to "idle" because persistentPreRun
 	// resets to "working" on every gt sub-command during gt done).
 	if state == polecat.HeartbeatWorking {
-		prefix := beads.GetPrefixForRig(d.config.TownRoot, rigName)
-		agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
+		beadsPrefix := beads.GetPrefixForRig(d.config.TownRoot, rigName)
+		agentBeadID := beads.PolecatBeadIDWithPrefix(beadsPrefix, rigName, polecatName)
 		info, err := d.getAgentBeadInfo(agentBeadID)
 		if err != nil {
 			// Agent bead lookup failed — polecat has no provable work.
 			// If heartbeat is stale enough (2x timeout), reap anyway to prevent
 			// indefinite API burn when bead infrastructure is degraded.
 			// But first check if the agent is actually running (GH#3342).
-			if staleDuration >= timeout*2 && !d.tmux.IsAgentRunning(sessionName) {
-				d.killIdlePolecat(rigName, polecatName, sessionName, staleDuration, timeout, "working-bead-lookup-failed")
+			if staleDuration >= timeout*2 && !d.tmux.IsAgentRunning(targetName) {
+				d.killIdlePolecat(rigName, polecatName, targetName, staleDuration, timeout, "working-bead-lookup-failed")
 			}
 			return
 		}
@@ -2780,32 +2835,46 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 		// No hooked work + stale heartbeat — but check if the agent process
 		// is still actively running before reaping. A failed gt sling rollback
 		// can clear the hook while the agent is still working (GH#3342).
-		if d.tmux.IsAgentRunning(sessionName) {
+		if d.tmux.IsAgentRunning(targetName) {
 			return
 		}
-		d.killIdlePolecat(rigName, polecatName, sessionName, staleDuration, timeout, "working-no-hook")
+		d.killIdlePolecat(rigName, polecatName, targetName, staleDuration, timeout, "working-no-hook")
 	}
 }
 
-// killIdlePolecat terminates an idle polecat session and cleans up.
-func (d *Daemon) killIdlePolecat(rigName, polecatName, sessionName string, idleDuration, timeout time.Duration, reason string) {
+// killIdlePolecat terminates an idle polecat session/window and cleans up.
+// targetName is the session name (session mode) or session:window (window mode).
+func (d *Daemon) killIdlePolecat(rigName, polecatName, targetName string, idleDuration, timeout time.Duration, reason string) {
 	d.logger.Printf("Reaping idle polecat %s/%s (state=%s, idle %v, threshold %v)",
 		rigName, polecatName, reason, idleDuration.Truncate(time.Second), timeout)
 
-	// Kill the tmux session (and all descendant processes)
-	if err := d.tmux.KillSessionWithProcesses(sessionName); err != nil {
-		d.logger.Printf("Warning: failed to kill idle polecat session %s: %v", sessionName, err)
+	// Kill the tmux session/window (and all descendant processes)
+	var killErr error
+	if agentconfig.IsWindowMode(d.config.TownRoot) {
+		prefix := session.PrefixFor(rigName)
+		rigSession := session.RigSessionName(prefix)
+		windowName := session.WindowName("polecat", polecatName)
+		killErr = d.tmux.KillWindowWithProcesses(rigSession, windowName)
+	} else {
+		killErr = d.tmux.KillSessionWithProcesses(targetName)
+	}
+	if killErr != nil {
+		d.logger.Printf("Warning: failed to kill idle polecat %s: %v", targetName, killErr)
 		return
 	}
 
-	// Clean up heartbeat file
-	polecat.RemoveSessionHeartbeat(d.config.TownRoot, sessionName)
+	// Clean up heartbeat file (uses session-style name as key)
+	heartbeatKey := targetName
+	if agentconfig.IsWindowMode(d.config.TownRoot) {
+		heartbeatKey = session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
+	}
+	polecat.RemoveSessionHeartbeat(d.config.TownRoot, heartbeatKey)
 
-	d.logger.Printf("Reaped idle polecat %s/%s — session killed, API slot freed", rigName, polecatName)
+	d.logger.Printf("Reaped idle polecat %s/%s — %s killed, API slot freed", rigName, polecatName, targetName)
 
 	// Emit feed event so the activity feed shows the reap
 	_ = events.LogFeed(events.TypeSessionDeath, fmt.Sprintf("%s/%s", rigName, polecatName),
-		events.SessionDeathPayload(sessionName, fmt.Sprintf("%s/polecats/%s", rigName, polecatName),
+		events.SessionDeathPayload(targetName, fmt.Sprintf("%s/polecats/%s", rigName, polecatName),
 			fmt.Sprintf("idle-reap: %s, idle %v (threshold %v)", reason, idleDuration.Truncate(time.Second), timeout),
 			"daemon"))
 }
